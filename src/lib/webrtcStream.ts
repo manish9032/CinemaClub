@@ -4,13 +4,12 @@ export type StreamRole = 'host' | 'viewer';
 export interface StreamCallbacks {
   onRemoteStream?: (stream: MediaStream) => void;
   onConnectionState?: (state: RTCPeerConnectionState) => void;
-  onError?: (err: Error) => void;
 }
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  // TURN servers (alag networks ke liye — free tier)
+  // TURN servers (WiFi + Mobile data ke liye)
   { urls: 'turn:relay.metered.ca:80', username: 'free', credential: 'free' },
   { urls: 'turn:relay.metered.ca:443', username: 'free', credential: 'free' },
   { urls: 'turn:relay.metered.ca:5349', username: 'free', credential: 'free' },
@@ -54,7 +53,7 @@ export class WebRTCStream {
         this.signalingChannel.send({
           type: 'broadcast',
           event: 'ice-candidate',
-          payload: { candidate: event.candidate, from: this.userId, to: 'all' },
+          payload: { candidate: event.candidate, from: this.userId },
         });
       }
     };
