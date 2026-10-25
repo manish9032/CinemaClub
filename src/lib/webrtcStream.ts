@@ -1,4 +1,4 @@
-// webrtcStream.ts
+// src/lib/webrtcStream.ts
 export type StreamRole = 'host' | 'viewer';
 
 export interface StreamCallbacks {
@@ -10,7 +10,10 @@ export interface StreamCallbacks {
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  // Agar alag networks pe fail ho to free TURN add karo (Metered.ca / Twilio free tier)
+  // TURN servers (alag networks ke liye — free tier)
+  { urls: 'turn:relay.metered.ca:80', username: 'free', credential: 'free' },
+  { urls: 'turn:relay.metered.ca:443', username: 'free', credential: 'free' },
+  { urls: 'turn:relay.metered.ca:5349', username: 'free', credential: 'free' },
 ];
 
 export class WebRTCStream {
@@ -20,7 +23,7 @@ export class WebRTCStream {
   private roomId: string;
   private userId: string;
   private callbacks: StreamCallbacks;
-  private signalingChannel: any; // Supabase Realtime channel
+  private signalingChannel: any;
 
   constructor(
     role: StreamRole,
@@ -39,9 +42,7 @@ export class WebRTCStream {
   async startAsHost(videoElement: HTMLVideoElement) {
     if (this.role !== 'host') throw new Error('Only host can start stream');
 
-    // Capture the playing video
     this.localStream = videoElement.captureStream();
-    
     this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
     this.localStream.getTracks().forEach(track => {
@@ -53,11 +54,7 @@ export class WebRTCStream {
         this.signalingChannel.send({
           type: 'broadcast',
           event: 'ice-candidate',
-          payload: {
-            candidate: event.candidate,
-            from: this.userId,
-            to: 'all', // ya specific viewer
-          },
+          payload: { candidate: event.candidate, from: this.userId, to: 'all' },
         });
       }
     };
@@ -66,17 +63,12 @@ export class WebRTCStream {
       this.callbacks.onConnectionState?.(this.pc!.connectionState);
     };
 
-    // Offer banao
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
-
     this.signalingChannel.send({
       type: 'broadcast',
       event: 'offer',
-      payload: {
-        sdp: offer,
-        from: this.userId,
-      },
+      payload: { sdp: offer, from: this.userId },
     });
   }
 
@@ -95,10 +87,7 @@ export class WebRTCStream {
         this.signalingChannel.send({
           type: 'broadcast',
           event: 'ice-candidate',
-          payload: {
-            candidate: event.candidate,
-            from: this.userId,
-          },
+          payload: { candidate: event.candidate, from: this.userId },
         });
       }
     };
@@ -113,14 +102,10 @@ export class WebRTCStream {
     await this.pc.setRemoteDescription(offer);
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
-
     this.signalingChannel.send({
       type: 'broadcast',
       event: 'answer',
-      payload: {
-        sdp: answer,
-        from: this.userId,
-      },
+      payload: { sdp: answer, from: this.userId },
     });
   }
 
@@ -133,15 +118,12 @@ export class WebRTCStream {
     if (!this.pc) return;
     try {
       await this.pc.addIceCandidate(candidate);
-    } catch (e) {
-      console.warn('ICE candidate error', e);
-    }
+    } catch (e) { console.warn('ICE candidate error', e); }
   }
 
   stop() {
     this.localStream?.getTracks().forEach(t => t.stop());
     this.pc?.close();
-    this.pc = null;
-    this.localStream = null;
+    this.pc = this.localStream = null;
   }
 }
