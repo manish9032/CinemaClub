@@ -1,17 +1,15 @@
 'use client';
 import { useState, useEffect, useRef } from 'react';
-import { useRealtime } from '@/lib/supabase'; // tumhara Supabase hook
+import { useRealtime } from '@/lib/supabase';
 import { WebRTCStream } from '@/lib/webrtcStream';
 
 export default function WatchRoomPage({ roomId }: { roomId: string }) {
   const { user, realtime } = useRealtime();
   const [isHost, setIsHost] = useState(false);
   const [localFileUrl, setLocalFileUrl] = useState<string | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<WebRTCStream | null>(null);
 
-  // Host file select
   const handleLocalFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -25,7 +23,6 @@ export default function WatchRoomPage({ roomId }: { roomId: string }) {
     }
   };
 
-  // Start live stream
   const startLiveStream = async () => {
     if (!videoRef.current || !isHost || !realtime) return;
 
@@ -35,12 +32,12 @@ export default function WatchRoomPage({ roomId }: { roomId: string }) {
       roomId,
       user.id,
       realtime,
-      { onConnectionState: (state) => console.log('Host', state) }
+      { onConnectionState: (state) => console.log('Host connection:', state) }
     );
     await streamRef.current.startAsHost(videoRef.current);
   };
 
-  // Viewer effect
+  // Viewer connection
   useEffect(() => {
     if (isHost || !realtime) return;
 
@@ -57,8 +54,7 @@ export default function WatchRoomPage({ roomId }: { roomId: string }) {
           }
         },
         onConnectionState: (state) => {
-          console.log('Viewer', state);
-          // "Receiving from host..." status update kar sakte ho yahan
+          console.log('Viewer connection:', state);
         },
       }
     );
@@ -80,22 +76,6 @@ export default function WatchRoomPage({ roomId }: { roomId: string }) {
     return () => stream.stop();
   }, [isHost, roomId, user?.id]);
 
-  // Host controls sync (play/pause/seek)
-  useEffect(() => {
-    if (!isHost || !realtime) return;
-
-    const handleControl = (data: any) => {
-      if (videoRef.current) {
-        videoRef.current.currentTime = data.time;
-        data.play ? videoRef.current.play() : videoRef.current.pause();
-      }
-    };
-
-    realtime.on('broadcast', { event: 'control' }, handleControl);
-
-    return () => realtime.off('broadcast', { event: 'control' });
-  }, [isHost, realtime]);
-
   return (
     <div className="flex flex-col h-screen bg-black">
       <video
@@ -103,28 +83,34 @@ export default function WatchRoomPage({ roomId }: { roomId: string }) {
         className="w-full h-full object-contain"
         muted={isHost}
         playsInline
-        onPlay={() => setIsPlaying(true)}
-        onPause={() => setIsPlaying(false)}
       />
 
       <div className="p-4 bg-zinc-900 flex gap-4">
-        <input type="file" accept="video/mp4" onChange={handleLocalFile} className="text-white" />
-        
+        <input
+          type="file"
+          accept="video/mp4,video/*"
+          onChange={handleLocalFile}
+          className="text-white"
+        />
+
         {isHost && (
-          <>
-            <button onClick={startLiveStream} className="bg-green-500 px-6 py-2 rounded">Start Live Stream</button>
-            <button onClick={() => videoRef.current?.pause()} className="bg-red-500 px-6 py-2 rounded">Pause</button>
-            <button onClick={() => videoRef.current?.play()} className="bg-blue-500 px-6 py-2 rounded">Play</button>
-          </>
+          <button
+            onClick={startLiveStream}
+            className="bg-green-500 px-6 py-2 rounded font-bold"
+          >
+            Start Live Stream
+          </button>
         )}
 
         {localFileUrl && (
-          <div className="text-green-400 text-sm">Local file ready • Live streaming active</div>
+          <div className="text-green-400 text-sm self-center">✅ Local file ready • Live streaming active</div>
         )}
       </div>
 
-      <div className="text-center text-zinc-400 mt-4">
-        {isHost ? 'Host mode - Live streaming enabled' : 'Viewer mode - Real-time stream will appear here'}
+      <div className="text-center text-zinc-400 mt-6">
+        {isHost 
+          ? 'Host mode - Movie will play here and stream to viewers' 
+          : 'Viewer mode - Real-time stream will appear here'}
       </div>
     </div>
   );
