@@ -478,7 +478,7 @@ export default function WatchRoomPage() {
         if (req) await req();
         try {
           const orient = screen.orientation as ScreenOrientation & {
-            lock?: (orientation: OrientationLockType | string) => Promise<void>;
+            lock?: (orientation: string) => Promise<void>;
           };
           if (typeof orient?.lock === 'function') {
             await orient.lock('landscape');
