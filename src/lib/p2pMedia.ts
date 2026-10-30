@@ -16,8 +16,8 @@ import { USE_LOCAL } from './mode';
 import { supabase } from './supabase';
 
 // ---- Tunables ----
-const CHUNK_SIZE_DEFAULT = 32 * 1024; // 32 KB
-const CHUNK_SIZE_MIN = 16 * 1024;
+const CHUNK_SIZE_DEFAULT = 64 * 1024; // 64 KB
+const CHUNK_SIZE_MAX = 64 * 1024;
 const CHUNK_SIZE_MAX = 64 * 1024;
 const PLAY_WHEN_BUFFERED = 1.5 * 1024 * 1024; // 1.5 MB
 const BUFFER_HIGH_WATER = 12 * 1024 * 1024;
