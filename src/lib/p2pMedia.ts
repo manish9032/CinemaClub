@@ -20,8 +20,6 @@ const CHUNK_SIZE_DEFAULT = 32 * 1024; // 32 KB
 const CHUNK_SIZE_MIN = 16 * 1024;
 const CHUNK_SIZE_MAX = 64 * 1024;
 const PLAY_WHEN_BUFFERED = 1.5 * 1024 * 1024; // 1.5 MB
-/** Start playback after this much data (higher = better MP4 compatibility) */
-const PLAY_WHEN_BUFFERED = 4 * 1024 * 1024; // 4 MB
 const BUFFER_HIGH_WATER = 12 * 1024 * 1024;
 const BUFFER_LOW_WATER = 2 * 1024 * 1024;
 
