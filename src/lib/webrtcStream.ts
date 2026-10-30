@@ -114,9 +114,9 @@ export class WebRTCStream {
 
     // 2. Capture AFTER frames exist
     // captureStream(fps) – 0 = same as source
-    const stream = (videoElement as any).captureStream
-      ? videoElement.captureStream()
-      : (videoElement as any).mozCaptureStream?.();
+ const stream = (videoElement as HTMLVideoElement & { captureStream?: () => MediaStream; mozCaptureStream?: () => MediaStream }).captureStream
+  ? (videoElement as HTMLVideoElement & { captureStream: () => MediaStream }).captureStream()
+  : (videoElement as HTMLVideoElement & { mozCaptureStream?: () => MediaStream }).mozCaptureStream?.();
 
     if (!stream) {
       throw new Error('captureStream not supported in this browser');
