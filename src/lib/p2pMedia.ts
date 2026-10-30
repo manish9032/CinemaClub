@@ -16,11 +16,11 @@ import { USE_LOCAL } from './mode';
 import { supabase } from './supabase';
 
 // ---- Tunables (smart buffer) ----
-const CHUNK_SIZE_DEFAULT = 256 * 1024; // 256 KiB
-const CHUNK_SIZE_MIN = 64 * 1024;
-const CHUNK_SIZE_MAX = 512 * 1024;
+const CHUNK_SIZE_DEFAULT = 12 * 1024; // 12 KiB (safe for DataChannel)
+const CHUNK_SIZE_MIN = 8 * 1024;
+const CHUNK_SIZE_MAX = 16 * 1024;
 /** Start playback once this many bytes are buffered (or full file if smaller). */
-const PLAY_WHEN_BUFFERED = 2 * 1024 * 1024; // 2 MiB
+const PLAY_WHEN_BUFFERED = 256 * 1024; // 256 KB
 /** High-water: pause sending when viewer buffer is this far ahead of playhead (bytes estimate). */
 const BUFFER_HIGH_WATER = 8 * 1024 * 1024;
 const BUFFER_LOW_WATER = 1.5 * 1024 * 1024;
@@ -128,11 +128,6 @@ function createSignaling(roomId: string, userId: string) {
 }
 
 // ---- Binary protocol over data channel ----
-// Control messages are JSON strings. Binary frames are raw chunk payloads
-// preceded by an 8-byte header: [uint32 index][uint32 byteLength] then payload.
-// Actually we send: first a JSON meta "chunk-meta", then binary ArrayBuffer for payload.
-// Simpler: one JSON control channel message type via separate labeling.
-
 type DcControl =
   | {
       t: 'meta';
@@ -241,7 +236,6 @@ export function createP2PHost(opts: {
     p.sending = true;
     try {
       while (!p.paused && p.nextIndex < totalChunks && p.dc.readyState === 'open') {
-        // Backpressure: wait if buffer is full
         while (p.dc.bufferedAmount > 2 * 1024 * 1024) {
           await new Promise((r) => setTimeout(r, 40));
           if (stopped || p.paused || p.dc.readyState !== 'open') break;
@@ -304,22 +298,20 @@ export function createP2PHost(opts: {
           void (async () => {
             const offset = msg.index * chunkSize;
             const size = Math.min(chunkSize, fileSize - offset);
-            const buf = await file.slice(offset, offset + size).arrayBuffer();
-            if (dc.readyState === 'open') {
-              sendControl(dc, { t: 'chunk', index: msg.index, offset, size });
-              dc.send(encodeChunkPacket(msg.index, buf));
-            }
+            const blob = file.slice(offset, offset + size);
+            const buf = await blob.arrayBuffer();
+            sendControl(dc, { t: 'chunk', index: msg.index, offset, size });
+            dc.send(encodeChunkPacket(msg.index, buf));
           })();
         }
       } catch {
         /* */
       }
     };
-    dc.onclose = () => closePeer(viewerId);
   };
 
   const makePeer = async (viewerId: string) => {
-    if (peers.has(viewerId)) closePeer(viewerId);
+    if (peers.has(viewerId) || stopped) return;
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
     const entry = {
       pc,
@@ -344,6 +336,7 @@ export function createP2PHost(opts: {
         });
       }
     };
+
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         closePeer(viewerId);
@@ -432,7 +425,6 @@ export function createP2PViewer(opts: {
   roomId: string;
   viewerId: string;
   hostId: string;
-  /** Called with a temporary object URL when enough data is buffered (or complete). */
   onPlayableUrl: (url: string | null, info?: { fileName: string; mime: string; complete: boolean }) => void;
   onStatus?: (status: string) => void;
   onBufferProgress?: (receivedBytes: number, totalBytes: number) => void;
@@ -471,7 +463,6 @@ export function createP2PViewer(opts: {
       if (!c) break;
       ordered.push(c);
     }
-    // Only emit progressive URL when we have a contiguous prefix
     const contiguousBytes = ordered.reduce((n, b) => n + (b as ArrayBuffer).byteLength, 0);
     const haveAll = chunks.size >= meta.totalChunks;
     complete = haveAll;
@@ -497,7 +488,6 @@ export function createP2PViewer(opts: {
 
   const maybeBackpressure = () => {
     if (!dc || dc.readyState !== 'open' || !meta) return;
-    // Estimate buffered unplayed content by received contiguous size
     if (!pausedDownload && receivedBytes > BUFFER_HIGH_WATER && !complete) {
       pausedDownload = true;
       dc.send(JSON.stringify({ t: 'pause' } satisfies DcControl));
@@ -507,7 +497,6 @@ export function createP2PViewer(opts: {
     }
   };
 
-  /** Call when player buffer is healthy / low so we can resume or pause fetch. */
   const reportPlayerBuffer = (bufferedAheadSeconds: number) => {
     if (!dc || dc.readyState !== 'open') return;
     if (bufferedAheadSeconds > 30 && !pausedDownload && !complete) {
@@ -551,11 +540,9 @@ export function createP2PViewer(opts: {
     chunks.set(parsed.index, parsed.data);
     receivedBytes += parsed.data.byteLength;
     opts.onBufferProgress?.(receivedBytes, meta.fileSize);
-    // Emit playable URL early once we have a good prefix
     if (!playableEmitted && receivedBytes >= Math.min(PLAY_WHEN_BUFFERED, meta.fileSize)) {
       rebuildBlobUrl();
     } else if (playableEmitted) {
-      // Refresh blob periodically as more contiguous data arrives (every ~16 chunks)
       if (parsed.index % 16 === 0) rebuildBlobUrl();
     }
     if (chunks.size >= meta.totalChunks) {
