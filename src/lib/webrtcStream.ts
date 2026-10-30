@@ -123,9 +123,9 @@ export class WebRTCStream {
     }
 
     this.localStream = stream;
-
-    // Force enable tracks (tainted / muted fix)
-    stream.getTracks().forEach((track: MediaStreamTrack) => {
+    
+    // Theek hai, lekin agar error aaye to
+    stream.getTracks().forEach((track) => {
       track.enabled = true;
       // some browsers start muted
       if ('muted' in track && (track as any).muted) {
@@ -192,7 +192,7 @@ export class WebRTCStream {
 
     await waitForVideoReady(videoElement);
 
-    const newStream = videoElement.captureStream();
+    const newStream = (videoElement as HTMLVideoElement & { captureStream: () => MediaStream }).captureStream();
     newStream.getTracks().forEach((t) => (t.enabled = true));
 
     const newVideo = newStream.getVideoTracks()[0] || null;
