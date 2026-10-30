@@ -5,25 +5,24 @@
  * Movie bytes are NEVER uploaded or stored in the database — only live P2P
  * transfer while the room is active, then discarded.
  *
- * Codecs:
- * - H.264 / AAC in MP4 → best compatibility (Chrome, Safari, Edge, Firefox)
- * - VP9 / WebM → good in Chrome/Firefox; Safari limited
- * - AV1 → newer browsers only; highest efficiency, lowest bandwidth
- * Prefer MP4 (H.264) for rooms with mixed devices.
+ * Supported formats (best to worst):
+ * - MP4 (H.264 + AAC) with faststart → best
+ * - WebM (VP8/VP9) → good progressive play
+ * - MKV → limited browser support (Chrome may fail)
+ * - MOV → works in some browsers
  */
 
 import { USE_LOCAL } from './mode';
 import { supabase } from './supabase';
 
-// ---- Tunables (smart buffer) ----
-const CHUNK_SIZE_DEFAULT = 12 * 1024; // 12 KiB (safe for DataChannel)
-const CHUNK_SIZE_MIN = 8 * 1024;
-const CHUNK_SIZE_MAX = 16 * 1024;
-/** Start playback once this many bytes are buffered (or full file if smaller). */
-const PLAY_WHEN_BUFFERED = 256 * 1024; // 256 KB
-/** High-water: pause sending when viewer buffer is this far ahead of playhead (bytes estimate). */
-const BUFFER_HIGH_WATER = 8 * 1024 * 1024;
-const BUFFER_LOW_WATER = 1.5 * 1024 * 1024;
+// ---- Tunables ----
+const CHUNK_SIZE_DEFAULT = 32 * 1024; // 32 KB (better speed, still safe)
+const CHUNK_SIZE_MIN = 16 * 1024;
+const CHUNK_SIZE_MAX = 64 * 1024;
+/** Start playback after this much data (higher = better MP4 compatibility) */
+const PLAY_WHEN_BUFFERED = 4 * 1024 * 1024; // 4 MB
+const BUFFER_HIGH_WATER = 12 * 1024 * 1024;
+const BUFFER_LOW_WATER = 2 * 1024 * 1024;
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -127,7 +126,7 @@ function createSignaling(roomId: string, userId: string) {
   return { start, stop, send, subscribe };
 }
 
-// ---- Binary protocol over data channel ----
+// ---- Binary protocol ----
 type DcControl =
   | {
       t: 'meta';
@@ -171,19 +170,21 @@ function detectMime(file: File): string {
   if (n.endsWith('.webm')) return 'video/webm';
   if (n.endsWith('.mkv')) return 'video/x-matroska';
   if (n.endsWith('.mov')) return 'video/quicktime';
+  if (n.endsWith('.avi')) return 'video/x-msvideo';
+  if (n.endsWith('.flv')) return 'video/x-flv';
   return 'video/mp4';
 }
 
-/** Codec hint for UI / logging — not enforced at encode time (browser plays file as-is). */
 export function codecHint(mime: string, fileName: string): string {
   const m = (mime || '').toLowerCase();
   const n = fileName.toLowerCase();
-  if (m.includes('webm') || n.endsWith('.webm')) return 'VP8/VP9 (WebM) — efficient; Safari may lack support';
-  if (n.endsWith('.mkv')) return 'Often H.264/H.265 in MKV — Chrome may not play; prefer MP4';
-  return 'Prefer H.264 + AAC in MP4 for maximum device compatibility; AV1/VP9 save bandwidth where supported';
+  if (m.includes('webm') || n.endsWith('.webm')) return 'VP8/VP9 (WebM) — good progressive support';
+  if (n.endsWith('.mkv')) return 'MKV — limited support in Chrome. Prefer MP4 (H.264)';
+  if (n.endsWith('.avi')) return 'AVI — poor browser support';
+  return 'Prefer H.264 + AAC MP4 (faststart) for best compatibility';
 }
 
-// ---- Host: seed file over data channels ----
+// ---- Host ----
 export function createP2PHost(opts: {
   roomId: string;
   hostId: string;
@@ -195,8 +196,8 @@ export function createP2PHost(opts: {
   const mime = detectMime(file);
   const fileSize = file.size;
   let chunkSize = CHUNK_SIZE_DEFAULT;
-  if (fileSize < 5 * 1024 * 1024) chunkSize = CHUNK_SIZE_MIN;
-  if (fileSize > 500 * 1024 * 1024) chunkSize = CHUNK_SIZE_MAX;
+  if (fileSize < 10 * 1024 * 1024) chunkSize = CHUNK_SIZE_MIN;
+  if (fileSize > 1 * 1024 * 1024 * 1024) chunkSize = CHUNK_SIZE_MAX;
   const totalChunks = Math.ceil(fileSize / chunkSize) || 1;
 
   const signaling = createSignaling(opts.roomId, opts.hostId);
@@ -236,8 +237,8 @@ export function createP2PHost(opts: {
     p.sending = true;
     try {
       while (!p.paused && p.nextIndex < totalChunks && p.dc.readyState === 'open') {
-        while (p.dc.bufferedAmount > 2 * 1024 * 1024) {
-          await new Promise((r) => setTimeout(r, 40));
+        while (p.dc.bufferedAmount > 4 * 1024 * 1024) {
+          await new Promise((r) => setTimeout(r, 30));
           if (stopped || p.paused || p.dc.readyState !== 'open') break;
         }
         if (p.paused || p.dc.readyState !== 'open') break;
@@ -284,9 +285,8 @@ export function createP2PHost(opts: {
       if (typeof ev.data !== 'string') return;
       try {
         const msg = JSON.parse(ev.data) as DcControl;
-        if (msg.t === 'pause') {
-          p.paused = true;
-        } else if (msg.t === 'resume') {
+        if (msg.t === 'pause') p.paused = true;
+        else if (msg.t === 'resume') {
           p.paused = false;
           void pumpChunks(viewerId);
         } else if (msg.t === 'request') {
@@ -294,7 +294,6 @@ export function createP2PHost(opts: {
           p.paused = false;
           void pumpChunks(viewerId);
         } else if (msg.t === 'nack') {
-          // re-send single chunk
           void (async () => {
             const offset = msg.index * chunkSize;
             const size = Math.min(chunkSize, fileSize - offset);
@@ -420,7 +419,7 @@ export function createP2PHost(opts: {
   };
 }
 
-// ---- Viewer: receive chunks, smart buffer, play via Blob URL ----
+// ---- Viewer ----
 export function createP2PViewer(opts: {
   roomId: string;
   viewerId: string;
@@ -499,10 +498,10 @@ export function createP2PViewer(opts: {
 
   const reportPlayerBuffer = (bufferedAheadSeconds: number) => {
     if (!dc || dc.readyState !== 'open') return;
-    if (bufferedAheadSeconds > 30 && !pausedDownload && !complete) {
+    if (bufferedAheadSeconds > 40 && !pausedDownload && !complete) {
       pausedDownload = true;
       dc.send(JSON.stringify({ t: 'pause' } satisfies DcControl));
-    } else if (bufferedAheadSeconds < 8 && pausedDownload) {
+    } else if (bufferedAheadSeconds < 10 && pausedDownload) {
       pausedDownload = false;
       dc.send(JSON.stringify({ t: 'resume' } satisfies DcControl));
     }
@@ -543,7 +542,7 @@ export function createP2PViewer(opts: {
     if (!playableEmitted && receivedBytes >= Math.min(PLAY_WHEN_BUFFERED, meta.fileSize)) {
       rebuildBlobUrl();
     } else if (playableEmitted) {
-      if (parsed.index % 16 === 0) rebuildBlobUrl();
+      if (parsed.index % 32 === 0) rebuildBlobUrl();
     }
     if (chunks.size >= meta.totalChunks) {
       complete = true;
