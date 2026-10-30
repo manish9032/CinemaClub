@@ -6,6 +6,9 @@ import VideoPlayer from '../components/VideoPlayer';
 import YouTubePlayer from '../components/YouTubePlayer';
 import { createP2PHost, createP2PViewer } from '../lib/p2pMedia';
 import { extractYouTubeId } from '../utils/youtube';
+import { USE_LOCAL } from '../lib/mode';
+import { supabase } from '../lib/supabase';
+import { subscribeLocal } from '../lib/localStore';
 
 export default function WatchRoomPage() {
   const { roomId } = useParams<{ roomId: string }>();
@@ -21,13 +24,13 @@ export default function WatchRoomPage() {
   const [youtubeId, setYoutubeId] = useState<string | null>(null);
   const [bufferProgress, setBufferProgress] = useState<{ received: number; total: number } | null>(null);
   const [viewerCount, setViewerCount] = useState(0);
+  const [externalTime, setExternalTime] = useState<number | undefined>();
+  const [externalPlaying, setExternalPlaying] = useState<boolean | undefined>();
 
   const hostRef = useRef<ReturnType<typeof createP2PHost> | null>(null);
   const viewerRef = useRef<ReturnType<typeof createP2PViewer> | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const youtubeInputRef = useRef<HTMLInputElement>(null);
-
-  const isLocalMode = !room?.video_src_type || room.video_src_type === 'local';
 
   // Load room
   useEffect(() => {
@@ -44,6 +47,9 @@ export default function WatchRoomPage() {
       setRoom(r);
       setIsHost(r.host_id === user.id);
       setLocalFileName(r.local_file_name);
+      setExternalTime(r.current_time);
+      setExternalPlaying(r.is_playing);
+
       if (r.video_src_type === 'youtube' && r.video_src) {
         setYoutubeId(extractYouTubeId(r.video_src) || r.video_src);
         setStatus('YouTube ready');
@@ -60,7 +66,44 @@ export default function WatchRoomPage() {
     };
   }, [roomId, user]);
 
-  // Cleanup P2P on unmount
+  // Realtime playback sync
+  useEffect(() => {
+    if (!roomId || !user) return;
+
+    if (USE_LOCAL) {
+      const unsub = subscribeLocal((type, data: any) => {
+        if (type === 'playback' && data?.roomId?.toUpperCase() === roomId.toUpperCase()) {
+          setExternalTime(data.current_time);
+          setExternalPlaying(data.is_playing);
+        }
+      });
+      return unsub;
+    }
+
+    const channel = supabase.channel(`room-sync:${roomId.toUpperCase()}`);
+    channel
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'rooms',
+          filter: `id=eq.${roomId.toUpperCase()}`,
+        },
+        (payload) => {
+          const r = payload.new as Room;
+          setExternalTime(r.current_time);
+          setExternalPlaying(r.is_playing);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [roomId, user]);
+
+  // Cleanup P2P
   useEffect(() => {
     return () => {
       hostRef.current?.stop();
@@ -75,7 +118,7 @@ export default function WatchRoomPage() {
       setError(null);
       setStatus('Starting P2P share...');
       setLocalFileName(file.name);
-      setPlayUrl(URL.createObjectURL(file)); // host plays immediately from local blob
+      setPlayUrl(URL.createObjectURL(file));
 
       const host = createP2PHost({
         roomId,
@@ -88,15 +131,14 @@ export default function WatchRoomPage() {
       });
       hostRef.current = host;
       await host.start();
-      setStatus(`Sharing "${file.name}" — ${viewerCount} viewer(s) connected`);
+      setStatus(`Sharing "${file.name}"`);
 
-      // Persist source type so late joiners know
       await setVideoSource(roomId, user.id, 'local', undefined, file.name);
       setRoom((prev) =>
         prev ? { ...prev, video_src_type: 'local', local_file_name: file.name } : prev
       );
     },
-    [roomId, user, isHost, viewerCount]
+    [roomId, user, isHost]
   );
 
   const startViewerP2P = useCallback(async () => {
@@ -117,8 +159,8 @@ export default function WatchRoomPage() {
       },
       onStatus: (s) => {
         if (s === 'connected') setStatus('P2P connected — receiving video...');
-        else if (s === 'failed') setStatus('Connection failed — check network / try again');
-        else if (s === 'requesting') setStatus('Waiting for host to accept...');
+        else if (s === 'failed') setStatus('Connection failed — check network');
+        else if (s === 'requesting') setStatus('Waiting for host...');
       },
       onBufferProgress: (received, total) => setBufferProgress({ received, total }),
     });
@@ -126,7 +168,6 @@ export default function WatchRoomPage() {
     await viewer.start();
   }, [roomId, user, isHost, room?.host_id]);
 
-  // Auto-start viewer when room is local and we are not host
   useEffect(() => {
     if (isHost || !room || room.video_src_type !== 'local' || !room.host_id) return;
     void startViewerP2P();
@@ -135,10 +176,6 @@ export default function WatchRoomPage() {
   const handleLocalFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (!file.type.startsWith('video/') && !file.name.match(/\.(mp4|webm|mkv|mov|m4v)$/i)) {
-      setError('Please select a video file (MP4 recommended)');
-      return;
-    }
     await startHostP2P(file);
   };
 
@@ -194,15 +231,11 @@ export default function WatchRoomPage() {
               {room?.movie_title || 'Watch together'} · {isHost ? 'You are host' : `Host: ${room?.host_name}`}
             </p>
           </div>
-          <button
-            onClick={() => navigate('/')}
-            className="text-sm text-muted hover:text-text"
-          >
+          <button onClick={() => navigate('/')} className="text-sm text-muted hover:text-text">
             Leave
           </button>
         </div>
 
-        {/* Status */}
         <div className="glass rounded-xl p-3 mb-4 text-sm">
           <div className="flex items-center justify-between">
             <span className="text-violet-light">{status}</span>
@@ -223,7 +256,6 @@ export default function WatchRoomPage() {
           {error && <p className="text-red-400 mt-1">{error}</p>}
         </div>
 
-        {/* Host controls */}
         {isHost && (
           <div className="glass rounded-xl p-4 mb-4 space-y-3">
             <p className="text-xs mono-label text-muted">Share a video</p>
@@ -238,7 +270,7 @@ export default function WatchRoomPage() {
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="video/*,.mp4,.webm,.mkv,.mov,.m4v"
+                accept="video/*,.mp4,.webm,.mkv,.mov,.m4v,.avi"
                 className="hidden"
                 onChange={handleLocalFile}
               />
@@ -262,11 +294,12 @@ export default function WatchRoomPage() {
           </div>
         )}
 
-        {/* Player area */}
         <div className="aspect-video bg-black/40 rounded-2xl overflow-hidden mb-6 relative">
           {youtubeId ? (
             <YouTubePlayer
               videoId={youtubeId}
+              externalTime={isHost ? undefined : externalTime}
+              externalPlaying={isHost ? undefined : externalPlaying}
               onPlayState={onPlayState}
               className="w-full h-full"
             />
@@ -275,6 +308,8 @@ export default function WatchRoomPage() {
               src={playUrl}
               title={localFileName || room?.movie_title || 'Video'}
               isHost={isHost}
+              externalTime={isHost ? undefined : externalTime}
+              externalPlaying={isHost ? undefined : externalPlaying}
               onPlayState={onPlayState}
               className="w-full h-full"
             />
@@ -287,12 +322,11 @@ export default function WatchRoomPage() {
           )}
         </div>
 
-        {/* Tips */}
         {!youtubeId && room?.video_src_type === 'local' && (
           <div className="text-xs text-subtle space-y-1">
-            <p>• If connection stays on "connecting" or "failed", both people may be behind strict NAT. Add a TURN server in <code>src/lib/p2pMedia.ts</code> (ICE_SERVERS).</p>
-            <p>• Use MP4 with H.264 video + AAC audio for maximum browser support.</p>
-            <p>• Large files take time to buffer. Playback starts after ~2 MB is received.</p>
+            <p>• Use MP4 with H.264 + AAC for best results. Faststart MP4 starts faster.</p>
+            <p>• Large files take time. Playback starts after ~1.5–4 MB is received.</p>
+            <p>• Host controls playback. Viewers stay in sync.</p>
           </div>
         )}
       </div>
