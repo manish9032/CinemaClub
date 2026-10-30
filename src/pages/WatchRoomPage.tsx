@@ -67,15 +67,18 @@ export default function WatchRoomPage() {
   }, [roomId, user]);
 
   // Realtime playback sync
-  if (USE_LOCAL) {
-  const unsub = subscribeLocal((payload: any) => {
-    if (payload?.type === 'playback' && payload?.roomId?.toUpperCase() === roomId.toUpperCase()) {
-      setExternalTime(payload.current_time);
-      setExternalPlaying(payload.is_playing);
+  useEffect(() => {
+    if (!roomId || !user) return;
+
+    if (USE_LOCAL) {
+      const unsub = subscribeLocal((payload: any) => {
+        if (payload?.type === 'playback' && payload?.roomId?.toUpperCase() === roomId.toUpperCase()) {
+          setExternalTime(payload.current_time);
+          setExternalPlaying(payload.is_playing);
+        }
+      });
+      return unsub;
     }
-  });
-  return unsub;
-}
 
     const channel = supabase.channel(`room-sync:${roomId.toUpperCase()}`);
     channel
