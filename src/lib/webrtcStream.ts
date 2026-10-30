@@ -12,15 +12,29 @@ export interface StreamCallbacks {
 /** Signaling adapter – Socket.io ya Supabase dono ke saath chalega */
 export interface SignalingAdapter {
   send: (event: string, payload: any) => void;
-  on: (event: string, handler: (payload: any) => void) => () => void; // returns unsubscribe
+  on: (event: string, handler: (payload: any) => void) => () => void;
 }
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  // Production mein TURN zaroor add karo (alag networks ke liye)
-  // { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  {
+    urls: 'turn:openrelay.metered.ca:80',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
 ];
+
+// Fix TypeScript types for captureStream
+interface CaptureVideoElement extends HTMLVideoElement {
+  captureStream(frameRate?: number): MediaStream;
+  mozCaptureStream?(frameRate?: number): MediaStream;
+}
 
 /** Wait until video has real frames + audio ready */
 function waitForVideoReady(video: HTMLVideoElement, timeoutMs = 15000): Promise<void> {
@@ -62,7 +76,6 @@ function waitForVideoReady(video: HTMLVideoElement, timeoutMs = 15000): Promise<
     video.addEventListener('playing', onReady);
     video.addEventListener('error', onError);
 
-    // already partially ready?
     onReady();
   });
 }
@@ -98,13 +111,11 @@ export class WebRTCStream {
 
     this.callbacks.onStatus?.('preparing-video');
 
-    // 1. Video must be playing + have real dimensions
     try {
       if (videoElement.paused) {
         await videoElement.play();
       }
     } catch (e) {
-      // autoplay policy – try muted play then unmute
       videoElement.muted = true;
       await videoElement.play();
       videoElement.muted = false;
@@ -112,22 +123,19 @@ export class WebRTCStream {
 
     await waitForVideoReady(videoElement);
 
-    // 2. Capture AFTER frames exist
-    // captureStream(fps) – 0 = same as source
- const stream = (videoElement as HTMLVideoElement & { captureStream?: () => MediaStream; mozCaptureStream?: () => MediaStream }).captureStream
-  ? (videoElement as HTMLVideoElement & { captureStream: () => MediaStream }).captureStream()
-  : (videoElement as HTMLVideoElement & { mozCaptureStream?: () => MediaStream }).mozCaptureStream?.();
+    const captureEl = videoElement as CaptureVideoElement;
+    const stream = captureEl.captureStream
+      ? captureEl.captureStream()
+      : captureEl.mozCaptureStream?.();
 
     if (!stream) {
       throw new Error('captureStream not supported in this browser');
     }
 
     this.localStream = stream;
-    
-    // Theek hai, lekin agar error aaye to
-    stream.getTracks().forEach((track) => {
+
+    stream.getTracks().forEach((track: MediaStreamTrack) => {
       track.enabled = true;
-      // some browsers start muted
       if ('muted' in track && (track as any).muted) {
         console.warn('Track was muted, forcing enabled', track.kind);
       }
@@ -143,14 +151,14 @@ export class WebRTCStream {
     }
 
     console.log('[Host] tracks', {
-      video: videoTracks.map((t) => ({
+      video: videoTracks.map((t: MediaStreamTrack) => ({
         id: t.id,
         readyState: t.readyState,
         enabled: t.enabled,
         muted: (t as any).muted,
         settings: t.getSettings?.(),
       })),
-      audio: audioTracks.map((t) => ({
+      audio: audioTracks.map((t: MediaStreamTrack) => ({
         id: t.id,
         readyState: t.readyState,
         enabled: t.enabled,
@@ -159,7 +167,6 @@ export class WebRTCStream {
 
     this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-    // Prefer adding tracks via addTrack (creates senders we can replace later)
     this.senders = [];
     stream.getTracks().forEach((track: MediaStreamTrack) => {
       const sender = this.pc!.addTrack(track, stream);
@@ -169,12 +176,10 @@ export class WebRTCStream {
     this.wirePeerConnection();
     this.wireSignaling();
 
-    // Perfect negotiation style offer
     await this.createAndSendOffer();
     this.callbacks.onStatus?.('streaming');
   }
 
-  /** Host: switch to new local file / new video element without killing room */
   async replaceSource(videoElement: HTMLVideoElement) {
     if (this.role !== 'host' || !this.pc) {
       throw new Error('replaceSource only after startAsHost');
@@ -192,13 +197,12 @@ export class WebRTCStream {
 
     await waitForVideoReady(videoElement);
 
-    const newStream = (videoElement as HTMLVideoElement & { captureStream: () => MediaStream }).captureStream();
-    newStream.getTracks().forEach((t) => (t.enabled = true));
+    const newStream = (videoElement as CaptureVideoElement).captureStream();
+    newStream.getTracks().forEach((t: MediaStreamTrack) => (t.enabled = true));
 
     const newVideo = newStream.getVideoTracks()[0] || null;
     const newAudio = newStream.getAudioTracks()[0] || null;
 
-    // Replace existing senders
     for (const sender of this.senders) {
       if (sender.track?.kind === 'video' && newVideo) {
         await sender.replaceTrack(newVideo);
@@ -207,16 +211,13 @@ export class WebRTCStream {
       }
     }
 
-    // If previously no audio sender but now have audio → add
     if (newAudio && !this.senders.some((s) => s.track?.kind === 'audio')) {
       const s = this.pc.addTrack(newAudio, newStream);
       this.senders.push(s);
-      // need renegotiation
       await this.createAndSendOffer();
     }
 
-    // stop old tracks
-    this.localStream?.getTracks().forEach((t) => t.stop());
+    this.localStream?.getTracks().forEach((t: MediaStreamTrack) => t.stop());
     this.localStream = newStream;
 
     this.callbacks.onStatus?.('source-replaced');
@@ -260,8 +261,7 @@ export class WebRTCStream {
 
     this.pc.ontrack = (ev) => {
       const stream = ev.streams[0] || new MediaStream([ev.track]);
-      // ensure tracks enabled
-      stream.getTracks().forEach((t) => (t.enabled = true));
+      stream.getTracks().forEach((t: MediaStreamTrack) => (t.enabled = true));
 
       console.log('[Viewer] ontrack', {
         kind: ev.track.kind,
@@ -276,26 +276,25 @@ export class WebRTCStream {
   }
 
   private wireSignaling() {
-    // clean previous
     this.unsubscribers.forEach((u) => u());
     this.unsubscribers = [];
 
     this.unsubscribers.push(
-      this.signaling.on('offer', async (data) => {
+      this.signaling.on('offer', async (data: any) => {
         if (data.from === this.userId) return;
         await this.handleOffer(data.sdp, data.from);
       })
     );
 
     this.unsubscribers.push(
-      this.signaling.on('answer', async (data) => {
+      this.signaling.on('answer', async (data: any) => {
         if (data.from === this.userId) return;
         await this.handleAnswer(data.sdp);
       })
     );
 
     this.unsubscribers.push(
-      this.signaling.on('ice-candidate', async (data) => {
+      this.signaling.on('ice-candidate', async (data: any) => {
         if (data.from === this.userId) return;
         await this.handleIceCandidate(data.candidate);
       })
@@ -366,7 +365,7 @@ export class WebRTCStream {
   stop() {
     this.unsubscribers.forEach((u) => u());
     this.unsubscribers = [];
-    this.localStream?.getTracks().forEach((t) => t.stop());
+    this.localStream?.getTracks().forEach((t: MediaStreamTrack) => t.stop());
     this.pc?.close();
     this.pc = null;
     this.localStream = null;
