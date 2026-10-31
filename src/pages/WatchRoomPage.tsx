@@ -28,6 +28,13 @@ const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : S
 const formatTime = (iso: string): string =>
   new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
+/** Stable avatar colour per name (like YouTube live chat). */
+const avatarColor = (name: string): string => {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
+  return `hsl(${h} 55% 42%)`;
+};
+
 export default function WatchRoomPage() {
   const { roomId } = useParams<{ roomId: string }>();
   const navigate = useNavigate();
@@ -53,21 +60,24 @@ export default function WatchRoomPage() {
   const [isFs, setIsFs] = useState(false);
 
   // Members + chat
-  const [panel, setPanel] = useState<'chat' | 'members' | null>(null);
+  const [panel, setPanel] = useState<'members' | null>(null);
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [messages, setMessages] = useState<RoomMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatError, setChatError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [unread, setUnread] = useState(0);
+  const [chatOpen, setChatOpen] = useState(true);
+  const [showJump, setShowJump] = useState(false);
 
   const hostRef = useRef<WebRTCStream | null>(null);
   const playerWrapRef = useRef<HTMLDivElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const remoteShellRef = useRef<HTMLDivElement>(null);
   const blobUrlRef = useRef<string | null>(null);
-  const chatEndRef = useRef<HTMLDivElement>(null);
-  const panelRef = useRef<'chat' | 'members' | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const atBottomRef = useRef(true);
+  const chatOpenRef = useRef(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const youtubeInputRef = useRef<HTMLInputElement>(null);
 
@@ -174,9 +184,12 @@ export default function WatchRoomPage() {
   // Members + chat
   // ---------------------------------------------------------------------
   useEffect(() => {
-    panelRef.current = panel;
-    if (panel === 'chat') setUnread(0);
-  }, [panel]);
+    chatOpenRef.current = chatOpen;
+    if (chatOpen) {
+      setUnread(0);
+      atBottomRef.current = true;
+    }
+  }, [chatOpen]);
 
   // Initial load
   useEffect(() => {
@@ -203,7 +216,7 @@ export default function WatchRoomPage() {
 
     const addMessage = (msg: RoomMessage) => {
       setMessages((prev) => (prev.some((x) => x.id === msg.id) ? prev : [...prev, msg]));
-      if (panelRef.current !== 'chat' && msg.type === 'message' && msg.participant_id !== userId) {
+      if (!chatOpenRef.current && msg.type === 'message' && msg.participant_id !== userId) {
         setUnread((n) => n + 1);
       }
     };
@@ -241,10 +254,33 @@ export default function WatchRoomPage() {
     };
   }, [roomId, userId]);
 
-  // Keep the newest message in view
+  // YouTube-style autoscroll: stick to the newest message unless the user scrolled up
   useEffect(() => {
-    if (panel === 'chat') chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, panel]);
+    const el = scrollRef.current;
+    if (!el) return;
+    if (atBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+      setShowJump(false);
+    } else {
+      setShowJump(true);
+    }
+  }, [messages, chatOpen]);
+
+  const handleChatScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    atBottomRef.current = nearBottom;
+    if (nearBottom) setShowJump(false);
+  };
+
+  const jumpToLatest = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    atBottomRef.current = true;
+    setShowJump(false);
+  };
 
   const myName = participants.find((p) => p.user_id === userId)?.name || displayName;
 
@@ -252,6 +288,7 @@ export default function WatchRoomPage() {
     const text = chatInput.trim();
     if (!text || !roomId || !userId || sending) return;
     setSending(true);
+    atBottomRef.current = true;
     setChatError(null);
     setChatInput('');
     const msg = await sendMessage(roomId, userId, myName, text);
@@ -533,18 +570,6 @@ export default function WatchRoomPage() {
             >
               👥 Members ({participants.length})
             </button>
-            <button
-              type="button"
-              onClick={() => setPanel(panel === 'chat' ? null : 'chat')}
-              className={`text-sm hover:text-text ${panel === 'chat' ? 'text-violet-light' : 'text-muted'}`}
-            >
-              💬 Chat
-              {unread > 0 && (
-                <span className="ml-1 inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-full bg-violet-500 text-white text-[11px]">
-                  {unread}
-                </span>
-              )}
-            </button>
             <button onClick={handleLeave} className="text-sm text-muted hover:text-text">
               Leave
             </button>
@@ -609,8 +634,11 @@ export default function WatchRoomPage() {
         )}
 
         <div
+          className={`mb-6 grid gap-4 ${chatOpen ? 'lg:grid-cols-[minmax(0,1fr)_360px]' : ''}`}
+        >
+        <div
           ref={playerWrapRef}
-          className="aspect-video bg-black/40 rounded-2xl overflow-hidden mb-6 relative"
+          className="aspect-video bg-black/40 rounded-2xl overflow-hidden relative"
         >
           {youtubeId ? (
             <YouTubePlayer
@@ -698,6 +726,145 @@ export default function WatchRoomPage() {
           )}
         </div>
 
+        {chatOpen && (
+          <div className="relative h-[480px] lg:h-auto">
+            <div className="absolute inset-0 flex flex-col rounded-2xl overflow-hidden border border-white/10 bg-obsidian">
+              <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
+                <h2 className="text-sm font-semibold text-text">Live chat</h2>
+                <button
+                  type="button"
+                  onClick={() => setChatOpen(false)}
+                  className="text-xs text-muted hover:text-text"
+                >
+                  Hide chat
+                </button>
+              </div>
+
+              <div
+                ref={scrollRef}
+                onScroll={handleChatScroll}
+                className="flex-1 min-h-0 overflow-y-auto px-3 py-2 space-y-1"
+              >
+                {messages.length === 0 && (
+                  <p className="text-xs text-muted text-center mt-6">
+                    Welcome to the live chat! Say hi 👋
+                  </p>
+                )}
+                {messages.map((m) => {
+                  if (m.type === 'system') {
+                    return (
+                      <p key={m.id} className="text-xs text-subtle text-center py-1">
+                        {m.text}
+                      </p>
+                    );
+                  }
+                  const fromHost = !!room?.host_id && m.participant_id === room.host_id;
+                  const mine = m.participant_id === userId;
+                  return (
+                    <div
+                      key={m.id}
+                      title={formatTime(m.created_at)}
+                      className="flex items-start gap-2 py-1 text-sm leading-snug"
+                    >
+                      <span
+                        className="w-6 h-6 shrink-0 rounded-full flex items-center justify-center text-[11px] font-semibold text-white"
+                        style={{ backgroundColor: avatarColor(m.participant_name) }}
+                      >
+                        {m.participant_name.charAt(0).toUpperCase()}
+                      </span>
+                      <p className="min-w-0 break-words">
+                        <span
+                          className={`font-semibold mr-2 ${
+                            fromHost ? 'text-violet-light' : mine ? 'text-text' : 'text-muted'
+                          }`}
+                        >
+                          {m.participant_name}
+                          {fromHost && (
+                            <span className="ml-1 text-[10px] bg-violet-500/30 text-violet-light rounded px-1 py-px align-middle">
+                              Host
+                            </span>
+                          )}
+                        </span>
+                        <span className="text-text">{m.text}</span>
+                      </p>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {showJump && (
+                <button
+                  type="button"
+                  onClick={jumpToLatest}
+                  className="absolute bottom-28 left-1/2 -translate-x-1/2 text-xs bg-violet-500 text-white rounded-full px-3 py-1 shadow-lg"
+                >
+                  ↓ New messages
+                </button>
+              )}
+
+              {chatError && <p className="px-3 pb-1 text-xs text-red-400">{chatError}</p>}
+
+              <div className="border-t border-white/10 p-3">
+                <div className="flex items-center gap-2 mb-2 text-xs text-muted">
+                  <span
+                    className="w-5 h-5 shrink-0 rounded-full flex items-center justify-center text-[10px] font-semibold text-white"
+                    style={{ backgroundColor: avatarColor(myName) }}
+                  >
+                    {myName.charAt(0).toUpperCase()}
+                  </span>
+                  <span className="truncate">{myName}</span>
+                </div>
+                <div className="flex items-center gap-2 bg-white/5 border border-white/10 rounded-full pl-4 pr-1 py-1">
+                  <input
+                    type="text"
+                    value={chatInput}
+                    maxLength={1000}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        void handleSendChat();
+                      }
+                    }}
+                    placeholder="Chat..."
+                    className="flex-1 min-w-0 bg-transparent outline-none text-sm text-text placeholder:text-subtle"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleSendChat()}
+                    disabled={sending || !chatInput.trim()}
+                    aria-label="Send message"
+                    className="w-8 h-8 shrink-0 rounded-full bg-violet-500 text-white text-sm flex items-center justify-center disabled:opacity-40"
+                  >
+                    ➤
+                  </button>
+                </div>
+                {chatInput.length > 0 && (
+                  <div className="text-right text-[10px] text-subtle mt-1">{chatInput.length}/1000</div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        </div>
+
+        {!chatOpen && (
+          <div className="mb-6 -mt-3">
+            <button
+              type="button"
+              onClick={() => setChatOpen(true)}
+              className="text-sm text-muted hover:text-text"
+            >
+              💬 Show chat
+              {unread > 0 && (
+                <span className="ml-2 inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-full bg-violet-500 text-white text-[11px]">
+                  {unread}
+                </span>
+              )}
+            </button>
+          </div>
+        )}
+
         {!youtubeId && room?.video_src_type === 'local' && (
           <div className="text-xs text-subtle space-y-1">
             <p>• Host controls playback — play, pause and seek are mirrored live on every viewer.</p>
@@ -707,11 +874,11 @@ export default function WatchRoomPage() {
         )}
       </div>
 
-      {panel && (
+      {panel === 'members' && (
         <div className="fixed top-20 right-0 bottom-0 z-40 w-full sm:w-96 bg-obsidian border-l border-white/10 flex flex-col shadow-2xl">
           <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
             <h2 className="font-display text-lg font-semibold text-text">
-              {panel === 'chat' ? 'Chat' : `Members (${participants.length})`}
+              Members ({participants.length})
             </h2>
             <button
               type="button"
@@ -722,91 +889,29 @@ export default function WatchRoomPage() {
             </button>
           </div>
 
-          {panel === 'members' ? (
-            <ul className="flex-1 overflow-y-auto p-3 space-y-2">
-              {participants.length === 0 && (
-                <li className="text-sm text-muted p-2">No one here yet.</li>
-              )}
-              {[...participants]
-                .sort((a, b) => Number(b.is_host) - Number(a.is_host))
-                .map((p) => (
-                  <li key={p.id} className="flex items-center gap-3 glass rounded-lg px-3 py-2">
-                    <span className="w-8 h-8 shrink-0 rounded-full bg-violet-500/30 text-violet-light flex items-center justify-center text-sm font-semibold">
-                      {p.name.charAt(0).toUpperCase()}
+          <ul className="flex-1 overflow-y-auto p-3 space-y-2">
+            {participants.length === 0 && (
+              <li className="text-sm text-muted p-2">No one here yet.</li>
+            )}
+            {[...participants]
+              .sort((a, b) => Number(b.is_host) - Number(a.is_host))
+              .map((p) => (
+                <li key={p.id} className="flex items-center gap-3 glass rounded-lg px-3 py-2">
+                  <span className="w-8 h-8 shrink-0 rounded-full bg-violet-500/30 text-violet-light flex items-center justify-center text-sm font-semibold">
+                    {p.name.charAt(0).toUpperCase()}
+                  </span>
+                  <span className="flex-1 text-sm text-text truncate">
+                    {p.name}
+                    {p.user_id === userId && <span className="text-muted"> (you)</span>}
+                  </span>
+                  {p.is_host && (
+                    <span className="text-[11px] text-violet-light border border-violet-500/40 rounded px-1.5 py-0.5">
+                      Host
                     </span>
-                    <span className="flex-1 text-sm text-text truncate">
-                      {p.name}
-                      {p.user_id === userId && <span className="text-muted"> (you)</span>}
-                    </span>
-                    {p.is_host && (
-                      <span className="text-[11px] text-violet-light border border-violet-500/40 rounded px-1.5 py-0.5">
-                        Host
-                      </span>
-                    )}
-                  </li>
-                ))}
-            </ul>
-          ) : (
-            <>
-              <div className="flex-1 overflow-y-auto p-3 space-y-2">
-                {messages.length === 0 && (
-                  <p className="text-sm text-muted text-center mt-6">No messages yet. Say hi 👋</p>
-                )}
-                {messages.map((m) => {
-                  if (m.type === 'system') {
-                    return (
-                      <p key={m.id} className="text-xs text-subtle text-center">
-                        {m.text}
-                      </p>
-                    );
-                  }
-                  const mine = m.participant_id === userId;
-                  return (
-                    <div key={m.id} className={`flex flex-col ${mine ? 'items-end' : 'items-start'}`}>
-                      <span className="text-[11px] text-muted mb-0.5">
-                        {mine ? 'You' : m.participant_name} · {formatTime(m.created_at)}
-                      </span>
-                      <div
-                        className={`max-w-[85%] rounded-xl px-3 py-2 text-sm break-words ${
-                          mine ? 'bg-violet-500/80 text-white' : 'bg-white/10 text-text'
-                        }`}
-                      >
-                        {m.text}
-                      </div>
-                    </div>
-                  );
-                })}
-                <div ref={chatEndRef} />
-              </div>
-
-              {chatError && <p className="px-3 pb-1 text-xs text-red-400">{chatError}</p>}
-
-              <div className="p-3 border-t border-white/10 flex gap-2">
-                <input
-                  type="text"
-                  value={chatInput}
-                  maxLength={1000}
-                  onChange={(e) => setChatInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault();
-                      void handleSendChat();
-                    }
-                  }}
-                  placeholder="Type a message..."
-                  className="flex-1 min-w-0 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-text placeholder:text-subtle"
-                />
-                <button
-                  type="button"
-                  onClick={() => void handleSendChat()}
-                  disabled={sending || !chatInput.trim()}
-                  className="btn-primary text-sm disabled:opacity-50"
-                >
-                  Send
-                </button>
-              </div>
-            </>
-          )}
+                  )}
+                </li>
+              ))}
+          </ul>
         </div>
       )}
     </div>
