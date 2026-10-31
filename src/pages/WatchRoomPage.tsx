@@ -1,6 +1,3 @@
-
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
 import { getRoom, setVideoSource, syncPlayback, deleteRoom, type Room } from '../services/rooms';
 import { useAuth } from '../contexts/AuthContext';
 import { getRoom, setVideoSource, syncPlayback, type Room } from '../services/rooms';
@@ -247,29 +244,27 @@ export default function WatchRoomPage() {
           </div>
           {bufferProgress && bufferProgress.total > 0 && (
             <div className="mt-2 h-1.5 bg-white/10 rounded-full overflow-hidden">
-             <button onClick={() => navigate('/')} className="text-sm text-muted hover:text-text">
-  Leave
-</button>
+            <button onClick={() => navigate('/')} className="text-sm text-muted hover:text-text">
+                 Leave
+            </button>
 
-              {isHost && (
-  <button
-    onClick={async () => {
-      if (!roomId || !user) return;
-      if (!confirm('Delete this room?')) return;
-      const { error } = await deleteRoom(roomId, user.id);
-      if (error) {
-        alert(error);
-        return;
-      }
-      navigate('/');
-    }}
-    className="text-sm text-red-400 hover:text-red-300 ml-3"
-  >
-    Delete Room
-  </button>
-)}
-              
-              
+            {isHost && (
+              <button
+                onClick={async () => {
+                  if (!roomId || !user) return;
+                  if (!confirm('Delete this room?')) return;
+                  const { error } = await deleteRoom(roomId, user.id);
+                  if (error) {
+                    alert(error);
+                    return;
+                  }
+                  navigate('/');
+                }}
+                className="text-sm text-red-400 hover:text-red-300 ml-3"
+              >
+                Delete Room
+              </button>
+            )}     
               <div
                 className="h-full bg-violet-500 transition-all"
                 style={{
