@@ -1,6 +1,7 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import { getRoom, setVideoSource, syncPlayback, deleteRoom, type Room } from '../services/rooms';
 import { useAuth } from '../contexts/AuthContext';
-import { getRoom, setVideoSource, syncPlayback, type Room } from '../services/rooms';
 import VideoPlayer from '../components/VideoPlayer';
 import YouTubePlayer from '../components/YouTubePlayer';
 import { createP2PHost, createP2PViewer } from '../lib/p2pMedia';
@@ -194,6 +195,17 @@ export default function WatchRoomPage() {
     setRoom((prev) => (prev ? { ...prev, video_src_type: 'youtube', video_src: id } : prev));
   };
 
+  const handleDeleteRoom = async () => {
+    if (!roomId || !user) return;
+    if (!confirm('Delete this room?')) return;
+    const { error } = await deleteRoom(roomId, user.id);
+    if (error) {
+      alert(error);
+      return;
+    }
+    navigate('/');
+  };
+
   const onPlayState = useCallback(
     (playing: boolean, time: number) => {
       if (!isHost || !roomId || !user) return;
@@ -230,9 +242,20 @@ export default function WatchRoomPage() {
               {room?.movie_title || 'Watch together'} · {isHost ? 'You are host' : `Host: ${room?.host_name}`}
             </p>
           </div>
-          <button onClick={() => navigate('/')} className="text-sm text-muted hover:text-text">
-            Leave
-          </button>
+
+          <div className="flex items-center">
+            <button onClick={() => navigate('/')} className="text-sm text-muted hover:text-text">
+              Leave
+            </button>
+            {isHost && (
+              <button
+                onClick={handleDeleteRoom}
+                className="text-sm text-red-400 hover:text-red-300 ml-3"
+              >
+                Delete Room
+              </button>
+            )}
+          </div>
         </div>
 
         <div className="glass rounded-xl p-3 mb-4 text-sm">
@@ -244,27 +267,6 @@ export default function WatchRoomPage() {
           </div>
           {bufferProgress && bufferProgress.total > 0 && (
             <div className="mt-2 h-1.5 bg-white/10 rounded-full overflow-hidden">
-            <button onClick={() => navigate('/')} className="text-sm text-muted hover:text-text">
-                 Leave
-            </button>
-
-            {isHost && (
-              <button
-                onClick={async () => {
-                  if (!roomId || !user) return;
-                  if (!confirm('Delete this room?')) return;
-                  const { error } = await deleteRoom(roomId, user.id);
-                  if (error) {
-                    alert(error);
-                    return;
-                  }
-                  navigate('/');
-                }}
-                className="text-sm text-red-400 hover:text-red-300 ml-3"
-              >
-                Delete Room
-              </button>
-            )}     
               <div
                 className="h-full bg-violet-500 transition-all"
                 style={{
