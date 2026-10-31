@@ -4,16 +4,19 @@ import { getRoom, setVideoSource, syncPlayback, deleteRoom, type Room } from '..
 import { useAuth } from '../contexts/AuthContext';
 import VideoPlayer from '../components/VideoPlayer';
 import YouTubePlayer from '../components/YouTubePlayer';
-import { createP2PHost, createP2PViewer } from '../lib/p2pMedia';
+import { WebRTCStream, createRoomSignaling } from '../lib/webrtcStream';
 import { extractYouTubeId } from '../utils/youtube';
 import { USE_LOCAL } from '../lib/mode';
 import { supabase } from '../lib/supabase';
 import { subscribeLocal } from '../lib/localStore';
 
+const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
 export default function WatchRoomPage() {
   const { roomId } = useParams<{ roomId: string }>();
   const navigate = useNavigate();
   const { user } = useAuth();
+  const userId = user?.id;
 
   const [room, setRoom] = useState<Room | null>(null);
   const [isHost, setIsHost] = useState(false);
@@ -22,17 +25,28 @@ export default function WatchRoomPage() {
   const [localFileName, setLocalFileName] = useState<string | null>(null);
   const [playUrl, setPlayUrl] = useState<string | null>(null);
   const [youtubeId, setYoutubeId] = useState<string | null>(null);
-  const [bufferProgress, setBufferProgress] = useState<{ received: number; total: number } | null>(null);
   const [viewerCount, setViewerCount] = useState(0);
   const [externalTime, setExternalTime] = useState<number | undefined>();
   const [externalPlaying, setExternalPlaying] = useState<boolean | undefined>();
 
-  const hostRef = useRef<ReturnType<typeof createP2PHost> | null>(null);
-  const viewerRef = useRef<ReturnType<typeof createP2PViewer> | null>(null);
+  // Viewer-side live stream state
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [hasFrame, setHasFrame] = useState(false);
+  const [viewerMuted, setViewerMuted] = useState(false);
+  const [autoplayBlocked, setAutoplayBlocked] = useState(false);
+  const [isFs, setIsFs] = useState(false);
+
+  const hostRef = useRef<WebRTCStream | null>(null);
+  const playerWrapRef = useRef<HTMLDivElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteShellRef = useRef<HTMLDivElement>(null);
+  const blobUrlRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const youtubeInputRef = useRef<HTMLInputElement>(null);
 
+  // ---------------------------------------------------------------------
   // Load room
+  // ---------------------------------------------------------------------
   useEffect(() => {
     if (!roomId || !user) return;
     let cancelled = false;
@@ -66,7 +80,9 @@ export default function WatchRoomPage() {
     };
   }, [roomId, user]);
 
-  // Realtime playback sync
+  // ---------------------------------------------------------------------
+  // Realtime: playback sync (YouTube / direct stream) + video source changes
+  // ---------------------------------------------------------------------
   useEffect(() => {
     if (!roomId || !user) return;
 
@@ -94,6 +110,17 @@ export default function WatchRoomPage() {
           const r = payload.new as Room;
           setExternalTime(r.current_time);
           setExternalPlaying(r.is_playing);
+          // Let viewers follow when the host changes the video source.
+          setRoom((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  video_src_type: r.video_src_type,
+                  video_src: r.video_src,
+                  local_file_name: r.local_file_name,
+                }
+              : prev
+          );
         }
       )
       .subscribe();
@@ -103,80 +130,197 @@ export default function WatchRoomPage() {
     };
   }, [roomId, user]);
 
-  // Cleanup P2P
+  // Viewer follows the host's choice (YouTube <-> local live stream)
+  useEffect(() => {
+    if (isHost || !room) return;
+    if (room.video_src_type === 'youtube' && room.video_src) {
+      setYoutubeId(extractYouTubeId(room.video_src) || room.video_src);
+      setRemoteStream(null);
+      setPlayUrl(null);
+    } else if (room.video_src_type === 'local') {
+      setYoutubeId(null);
+      setLocalFileName(room.local_file_name);
+    }
+  }, [isHost, room?.video_src_type, room?.video_src, room?.local_file_name]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ---------------------------------------------------------------------
+  // Cleanup on leave
+  // ---------------------------------------------------------------------
   useEffect(() => {
     return () => {
       hostRef.current?.stop();
-      viewerRef.current?.stop();
+      hostRef.current = null;
+      if (blobUrlRef.current) {
+        URL.revokeObjectURL(blobUrlRef.current);
+        blobUrlRef.current = null;
+      }
     };
   }, []);
 
-  const startHostP2P = useCallback(
+  // ---------------------------------------------------------------------
+  // HOST: share a local file as a live stream
+  // ---------------------------------------------------------------------
+
+  /** Wait until React has mounted the host's <video> with the new blob URL. */
+  const waitForHostVideo = useCallback(async (url: string): Promise<HTMLVideoElement | null> => {
+    for (let i = 0; i < 100; i++) {
+      const video = playerWrapRef.current?.querySelector('video') ?? null;
+      if (video && video.src === url) return video;
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+    return null;
+  }, []);
+
+  const startHostLive = useCallback(
     async (file: File) => {
-      if (!roomId || !user || !isHost) return;
-      hostRef.current?.stop();
+      if (!roomId || !userId || !isHost) return;
+
       setError(null);
-      setStatus('Starting P2P share...');
+      setYoutubeId(null);
+      setStatus('Preparing video...');
       setLocalFileName(file.name);
-      setPlayUrl(URL.createObjectURL(file));
 
-      const host = createP2PHost({
-        roomId,
-        hostId: user.id,
-        file,
-        onViewerCount: setViewerCount,
-        onProgress: (_id, sent, total) => {
-          setBufferProgress({ received: sent, total });
-        },
-      });
-      hostRef.current = host;
-      await host.start();
-      setStatus(`Sharing "${file.name}"`);
+      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+      const url = URL.createObjectURL(file);
+      blobUrlRef.current = url;
+      setPlayUrl(url);
 
-      await setVideoSource(roomId, user.id, 'local', undefined, file.name);
+      const video = await waitForHostVideo(url);
+      if (!video) {
+        setError('Video player failed to initialise. Please choose the file again.');
+        return;
+      }
+
+      try {
+        if (hostRef.current) {
+          await hostRef.current.replaceSource(video);
+        } else {
+          const host = new WebRTCStream('host', userId, createRoomSignaling(roomId, userId), {
+            onViewerCount: setViewerCount,
+            onError: (err) => console.error('[host stream]', err),
+          });
+          hostRef.current = host;
+          await host.startAsHost(video);
+        }
+      } catch (e) {
+        setError(errorMessage(e));
+        return;
+      }
+
+      setStatus(`Sharing "${file.name}" live — press play, viewers follow instantly`);
+      await setVideoSource(roomId, userId, 'local', undefined, file.name);
       setRoom((prev) =>
         prev ? { ...prev, video_src_type: 'local', local_file_name: file.name } : prev
       );
     },
-    [roomId, user, isHost]
+    [roomId, userId, isHost, waitForHostVideo]
   );
 
-  const startViewerP2P = useCallback(async () => {
-    if (!roomId || !user || isHost || !room?.host_id) return;
-    viewerRef.current?.stop();
-    setError(null);
-    setStatus('Requesting video from host...');
+  // ---------------------------------------------------------------------
+  // VIEWER: receive the live MediaStream
+  // ---------------------------------------------------------------------
+  useEffect(() => {
+    if (isHost || !roomId || !userId || room?.video_src_type !== 'local') return;
 
-    const viewer = createP2PViewer({
-      roomId,
-      viewerId: user.id,
-      hostId: room.host_id,
-      onPlayableUrl: (url, info) => {
-        setPlayUrl(url);
-        if (info?.complete) setStatus(`Playing "${info.fileName}" (complete)`);
-        else if (url) setStatus(`Playing "${info?.fileName || 'video'}" (buffering...)`);
-        else setStatus('Host stopped sharing');
+    setStatus('Waiting for host...');
+    const viewer = new WebRTCStream('viewer', userId, createRoomSignaling(roomId, userId), {
+      onRemoteStream: (stream) => {
+        setRemoteStream(stream);
+        setStatus('Live — synced with host');
       },
-      onStatus: (s) => {
-        if (s === 'connected') setStatus('P2P connected — receiving video...');
-        else if (s === 'failed') setStatus('Connection failed — check network');
-        else if (s === 'requesting') setStatus('Waiting for host...');
+      onRemoteStreamEnded: () => {
+        setRemoteStream(null);
+        setStatus('Host stopped sharing');
       },
-      onBufferProgress: (received, total) => setBufferProgress({ received, total }),
+      onConnectionState: (state) => {
+        if (state === 'connected') setStatus('Live — synced with host');
+        else if (state === 'connecting') setStatus('Connecting to host...');
+        else if (state === 'failed' || state === 'disconnected') {
+          setStatus('Connection lost — reconnecting...');
+        }
+      },
+      onError: (err) => console.error('[viewer stream]', err),
     });
-    viewerRef.current = viewer;
-    await viewer.start();
-  }, [roomId, user, isHost, room?.host_id]);
+
+    void viewer.startAsViewer();
+
+    return () => {
+      viewer.stop();
+      setRemoteStream(null);
+    };
+  }, [isHost, roomId, userId, room?.video_src_type]);
+
+  /** Play the live stream; if the browser blocks autoplay, mute and retry. */
+  const playRemote = useCallback(async (video: HTMLVideoElement) => {
+    setAutoplayBlocked(false);
+    try {
+      await video.play();
+    } catch (err) {
+      const blocked = err instanceof DOMException && err.name === 'NotAllowedError';
+      if (blocked) video.muted = true; // autoplay policy: muted playback is always allowed
+      try {
+        await video.play();
+      } catch (retryErr) {
+        console.warn('[viewer] autoplay still blocked', retryErr);
+        setAutoplayBlocked(true);
+      }
+    }
+    setViewerMuted(video.muted);
+  }, []);
+
+  // Bind the MediaStream directly to <video>.srcObject (no blob / playUrl)
+  useEffect(() => {
+    const video = remoteVideoRef.current;
+    if (!video) return;
+
+    if (!remoteStream) {
+      video.srcObject = null;
+      return;
+    }
+
+    setHasFrame(false);
+    video.srcObject = remoteStream;
+    void playRemote(video);
+
+    return () => {
+      video.srcObject = null;
+    };
+  }, [remoteStream, playRemote]);
 
   useEffect(() => {
-    if (isHost || !room || room.video_src_type !== 'local' || !room.host_id) return;
-    void startViewerP2P();
-  }, [isHost, room, startViewerP2P]);
+    const onFs = () => setIsFs(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', onFs);
+    return () => document.removeEventListener('fullscreenchange', onFs);
+  }, []);
 
+  const toggleViewerMute = () => {
+    const video = remoteVideoRef.current;
+    if (!video) return;
+    video.muted = !video.muted;
+    setViewerMuted(video.muted);
+    if (video.paused) void playRemote(video);
+  };
+
+  const toggleViewerFullscreen = async () => {
+    const el = remoteShellRef.current;
+    if (!el) return;
+    try {
+      if (!document.fullscreenElement) await el.requestFullscreen();
+      else await document.exitFullscreen();
+    } catch {
+      /* ignore */
+    }
+  };
+
+  // ---------------------------------------------------------------------
+  // Handlers
+  // ---------------------------------------------------------------------
   const handleLocalFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const input = e.target;
+    const file = input.files?.[0];
     if (!file) return;
-    await startHostP2P(file);
+    await startHostLive(file);
+    input.value = '';
   };
 
   const handleYouTubeSubmit = async () => {
@@ -188,6 +332,9 @@ export default function WatchRoomPage() {
       return;
     }
     setError(null);
+    hostRef.current?.stop();
+    hostRef.current = null;
+    setViewerCount(0);
     setYoutubeId(id);
     setPlayUrl(null);
     setStatus('YouTube loaded');
@@ -198,9 +345,9 @@ export default function WatchRoomPage() {
   const handleDeleteRoom = async () => {
     if (!roomId || !user) return;
     if (!confirm('Delete this room?')) return;
-    const { error } = await deleteRoom(roomId, user.id);
-    if (error) {
-      alert(error);
+    const { error: delError } = await deleteRoom(roomId, user.id);
+    if (delError) {
+      alert(delError);
       return;
     }
     navigate('/');
@@ -214,6 +361,9 @@ export default function WatchRoomPage() {
     [isHost, roomId, user]
   );
 
+  // ---------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------
   if (!user) {
     return (
       <div className="min-h-screen bg-obsidian pt-24 flex items-center justify-center text-muted">
@@ -265,16 +415,6 @@ export default function WatchRoomPage() {
               <span className="text-muted">{viewerCount} viewer(s)</span>
             )}
           </div>
-          {bufferProgress && bufferProgress.total > 0 && (
-            <div className="mt-2 h-1.5 bg-white/10 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-violet-500 transition-all"
-                style={{
-                  width: `${Math.min(100, (bufferProgress.received / bufferProgress.total) * 100)}%`,
-                }}
-              />
-            </div>
-          )}
           {error && <p className="text-red-400 mt-1">{error}</p>}
         </div>
 
@@ -310,13 +450,17 @@ export default function WatchRoomPage() {
               </div>
             </div>
             <p className="text-xs text-subtle">
-              Local files are streamed peer-to-peer (never uploaded to a server). Prefer MP4 (H.264) for best compatibility.
-              YouTube works instantly for everyone.
+              Local files are streamed live, peer-to-peer (never uploaded to a server). Play, pause and seek are
+              mirrored on every viewer instantly. Keep this tab open while sharing. Prefer MP4 (H.264) for best
+              compatibility.
             </p>
           </div>
         )}
 
-        <div className="aspect-video bg-black/40 rounded-2xl overflow-hidden mb-6 relative">
+        <div
+          ref={playerWrapRef}
+          className="aspect-video bg-black/40 rounded-2xl overflow-hidden mb-6 relative"
+        >
           {youtubeId ? (
             <YouTubePlayer
               videoId={youtubeId}
@@ -325,6 +469,65 @@ export default function WatchRoomPage() {
               onPlayState={onPlayState}
               className="w-full h-full"
             />
+          ) : !isHost && remoteStream ? (
+            <div ref={remoteShellRef} className="relative w-full h-full bg-black">
+              <video
+                ref={remoteVideoRef}
+                className="w-full h-full object-contain bg-black"
+                autoPlay
+                playsInline
+                onLoadedData={() => setHasFrame(true)}
+                onPlaying={() => setHasFrame(true)}
+                onVolumeChange={(e) => setViewerMuted(e.currentTarget.muted)}
+              />
+
+              {!hasFrame && !autoplayBlocked && (
+                <div className="absolute inset-0 flex items-center justify-center text-muted text-sm bg-black/60 pointer-events-none">
+                  Waiting for host to press play...
+                </div>
+              )}
+
+              {autoplayBlocked && (
+                <button
+                  type="button"
+                  onClick={() => remoteVideoRef.current && void playRemote(remoteVideoRef.current)}
+                  className="absolute inset-0 flex items-center justify-center bg-black/60"
+                >
+                  <span className="btn-primary text-sm">▶ Click to start watching</span>
+                </button>
+              )}
+
+              {viewerMuted && hasFrame && !autoplayBlocked && (
+                <button
+                  type="button"
+                  onClick={toggleViewerMute}
+                  className="absolute top-3 left-3 btn-primary text-xs"
+                >
+                  🔊 Tap to unmute
+                </button>
+              )}
+
+              <div className="absolute top-3 right-3 text-[11px] text-white/80 bg-black/50 rounded px-2 py-0.5">
+                ● LIVE · synced with host
+              </div>
+
+              <div className="absolute bottom-3 right-3 flex gap-2">
+                <button
+                  type="button"
+                  onClick={toggleViewerMute}
+                  className="text-white/90 hover:text-white text-xs bg-black/50 rounded px-2 py-1"
+                >
+                  {viewerMuted ? 'Unmute' : 'Mute'}
+                </button>
+                <button
+                  type="button"
+                  onClick={toggleViewerFullscreen}
+                  className="text-white/90 hover:text-white text-xs bg-black/50 rounded px-2 py-1"
+                >
+                  {isFs ? 'Exit fullscreen' : 'Fullscreen'}
+                </button>
+              </div>
+            </div>
           ) : playUrl ? (
             <VideoPlayer
               src={playUrl}
@@ -346,9 +549,9 @@ export default function WatchRoomPage() {
 
         {!youtubeId && room?.video_src_type === 'local' && (
           <div className="text-xs text-subtle space-y-1">
-            <p>• Use MP4 with H.264 + AAC for best results. Faststart MP4 starts faster.</p>
-            <p>• Large files take time. Playback starts after ~1.5–4 MB is received.</p>
-            <p>• Host controls playback. Viewers stay in sync.</p>
+            <p>• Host controls playback — play, pause and seek are mirrored live on every viewer.</p>
+            <p>• If the browser blocks sound, the video starts muted — tap “Unmute” once.</p>
+            <p>• Quality depends on the host’s upload speed. MP4 (H.264 + AAC) works best.</p>
           </div>
         )}
       </div>
