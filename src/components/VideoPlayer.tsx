@@ -1,4 +1,4 @@
-import { useRef, useState, useEffect, useCallback } from 'react';
+import { useRef, useState, useEffect, useCallback, type ReactNode } from 'react';
 
 type Props = {
   src: string | null;
@@ -10,6 +10,8 @@ type Props = {
   /** External sync from host */
   externalTime?: number;
   externalPlaying?: boolean;
+  /** Extra layer drawn on top of the video (also visible in fullscreen) */
+  overlay?: ReactNode;
   className?: string;
 };
 
@@ -30,6 +32,7 @@ export default function VideoPlayer({
   onSeek,
   externalTime,
   externalPlaying,
+  overlay,
   className = '',
 }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -487,6 +490,7 @@ export default function VideoPlayer({
           </button>
         </div>
       </div>
+      {overlay}
     </div>
   );
 }
