@@ -194,7 +194,7 @@ export function createP2PHost(opts: {
   const mime = detectMime(file);
   const fileSize = file.size;
   let chunkSize = CHUNK_SIZE_DEFAULT;
-  if (fileSize < 10 * 1024 * 1024) chunkSize = CHUNK_SIZE_MIN;
+  if (fileSize < 10 * 1024 * 1024) chunkSize = CHUNK_SIZE_DEFAULT;
   if (fileSize > 1 * 1024 * 1024 * 1024) chunkSize = CHUNK_SIZE_MAX;
   const totalChunks = Math.ceil(fileSize / chunkSize) || 1;
 
