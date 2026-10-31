@@ -1,6 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { getRoom, setVideoSource, syncPlayback, deleteRoom, type Room } from '../services/rooms';
+import {
+  getRoom,
+  setVideoSource,
+  syncPlayback,
+  deleteRoom,
+  leaveRoom,
+  reactivateParticipant,
+  getParticipants,
+  getMessages,
+  sendMessage,
+  type Room,
+  type Participant,
+  type RoomMessage,
+} from '../services/rooms';
 import { useAuth } from '../contexts/AuthContext';
 import VideoPlayer from '../components/VideoPlayer';
 import YouTubePlayer from '../components/YouTubePlayer';
@@ -12,10 +25,13 @@ import { subscribeLocal } from '../lib/localStore';
 
 const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
+const formatTime = (iso: string): string =>
+  new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
 export default function WatchRoomPage() {
   const { roomId } = useParams<{ roomId: string }>();
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, displayName } = useAuth();
   const userId = user?.id;
 
   const [room, setRoom] = useState<Room | null>(null);
@@ -36,11 +52,22 @@ export default function WatchRoomPage() {
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
   const [isFs, setIsFs] = useState(false);
 
+  // Members + chat
+  const [panel, setPanel] = useState<'chat' | 'members' | null>(null);
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [messages, setMessages] = useState<RoomMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+  const [unread, setUnread] = useState(0);
+
   const hostRef = useRef<WebRTCStream | null>(null);
   const playerWrapRef = useRef<HTMLDivElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const remoteShellRef = useRef<HTMLDivElement>(null);
   const blobUrlRef = useRef<string | null>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<'chat' | 'members' | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const youtubeInputRef = useRef<HTMLInputElement>(null);
 
@@ -142,6 +169,111 @@ export default function WatchRoomPage() {
       setLocalFileName(room.local_file_name);
     }
   }, [isHost, room?.video_src_type, room?.video_src, room?.local_file_name]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ---------------------------------------------------------------------
+  // Members + chat
+  // ---------------------------------------------------------------------
+  useEffect(() => {
+    panelRef.current = panel;
+    if (panel === 'chat') setUnread(0);
+  }, [panel]);
+
+  // Initial load
+  useEffect(() => {
+    if (!roomId || !userId) return;
+    let cancelled = false;
+
+    (async () => {
+      await reactivateParticipant(roomId, userId, displayName);
+      const [p, m] = await Promise.all([getParticipants(roomId), getMessages(roomId)]);
+      if (cancelled) return;
+      setParticipants(p);
+      setMessages(m);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [roomId, userId, displayName]);
+
+  // Realtime: new messages + members joining / leaving
+  useEffect(() => {
+    if (!roomId || !userId) return;
+    const id = roomId.toUpperCase();
+
+    const addMessage = (msg: RoomMessage) => {
+      setMessages((prev) => (prev.some((x) => x.id === msg.id) ? prev : [...prev, msg]));
+      if (panelRef.current !== 'chat' && msg.type === 'message' && msg.participant_id !== userId) {
+        setUnread((n) => n + 1);
+      }
+    };
+    const refreshParticipants = () => {
+      void getParticipants(roomId).then(setParticipants);
+    };
+
+    if (USE_LOCAL) {
+      return subscribeLocal((ev: any) => {
+        if (ev?.roomId?.toUpperCase?.() !== id) return;
+        if (ev.type === 'participants') refreshParticipants();
+        else if (ev.type === 'messages') {
+          if (ev.message) addMessage(ev.message as RoomMessage);
+          else void getMessages(roomId).then(setMessages);
+        }
+      });
+    }
+
+    const channel = supabase.channel(`room-chat:${id}`);
+    channel
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'room_messages', filter: `room_id=eq.${id}` },
+        (payload) => addMessage(payload.new as RoomMessage)
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'room_participants', filter: `room_id=eq.${id}` },
+        () => refreshParticipants()
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [roomId, userId]);
+
+  // Keep the newest message in view
+  useEffect(() => {
+    if (panel === 'chat') chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, panel]);
+
+  const myName = participants.find((p) => p.user_id === userId)?.name || displayName;
+
+  const handleSendChat = async () => {
+    const text = chatInput.trim();
+    if (!text || !roomId || !userId || sending) return;
+    setSending(true);
+    setChatError(null);
+    setChatInput('');
+    const msg = await sendMessage(roomId, userId, myName, text);
+    if (msg) {
+      setMessages((prev) => (prev.some((x) => x.id === msg.id) ? prev : [...prev, msg]));
+    } else {
+      setChatInput(text);
+      setChatError('Message could not be sent. Please try again.');
+    }
+    setSending(false);
+  };
+
+  const handleLeave = async () => {
+    if (roomId && userId) {
+      try {
+        await leaveRoom(roomId, userId);
+      } catch {
+        /* ignore – still leave the page */
+      }
+    }
+    navigate('/');
+  };
 
   // ---------------------------------------------------------------------
   // Cleanup on leave
@@ -393,14 +525,33 @@ export default function WatchRoomPage() {
             </p>
           </div>
 
-          <div className="flex items-center">
-            <button onClick={() => navigate('/')} className="text-sm text-muted hover:text-text">
+          <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-1">
+            <button
+              type="button"
+              onClick={() => setPanel(panel === 'members' ? null : 'members')}
+              className={`text-sm hover:text-text ${panel === 'members' ? 'text-violet-light' : 'text-muted'}`}
+            >
+              👥 Members ({participants.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setPanel(panel === 'chat' ? null : 'chat')}
+              className={`text-sm hover:text-text ${panel === 'chat' ? 'text-violet-light' : 'text-muted'}`}
+            >
+              💬 Chat
+              {unread > 0 && (
+                <span className="ml-1 inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-full bg-violet-500 text-white text-[11px]">
+                  {unread}
+                </span>
+              )}
+            </button>
+            <button onClick={handleLeave} className="text-sm text-muted hover:text-text">
               Leave
             </button>
             {isHost && (
               <button
                 onClick={handleDeleteRoom}
-                className="text-sm text-red-400 hover:text-red-300 ml-3"
+                className="text-sm text-red-400 hover:text-red-300"
               >
                 Delete Room
               </button>
@@ -555,6 +706,109 @@ export default function WatchRoomPage() {
           </div>
         )}
       </div>
+
+      {panel && (
+        <div className="fixed top-20 right-0 bottom-0 z-40 w-full sm:w-96 bg-obsidian border-l border-white/10 flex flex-col shadow-2xl">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
+            <h2 className="font-display text-lg font-semibold text-text">
+              {panel === 'chat' ? 'Chat' : `Members (${participants.length})`}
+            </h2>
+            <button
+              type="button"
+              onClick={() => setPanel(null)}
+              className="text-sm text-muted hover:text-text"
+            >
+              ✕ Close
+            </button>
+          </div>
+
+          {panel === 'members' ? (
+            <ul className="flex-1 overflow-y-auto p-3 space-y-2">
+              {participants.length === 0 && (
+                <li className="text-sm text-muted p-2">No one here yet.</li>
+              )}
+              {[...participants]
+                .sort((a, b) => Number(b.is_host) - Number(a.is_host))
+                .map((p) => (
+                  <li key={p.id} className="flex items-center gap-3 glass rounded-lg px-3 py-2">
+                    <span className="w-8 h-8 shrink-0 rounded-full bg-violet-500/30 text-violet-light flex items-center justify-center text-sm font-semibold">
+                      {p.name.charAt(0).toUpperCase()}
+                    </span>
+                    <span className="flex-1 text-sm text-text truncate">
+                      {p.name}
+                      {p.user_id === userId && <span className="text-muted"> (you)</span>}
+                    </span>
+                    {p.is_host && (
+                      <span className="text-[11px] text-violet-light border border-violet-500/40 rounded px-1.5 py-0.5">
+                        Host
+                      </span>
+                    )}
+                  </li>
+                ))}
+            </ul>
+          ) : (
+            <>
+              <div className="flex-1 overflow-y-auto p-3 space-y-2">
+                {messages.length === 0 && (
+                  <p className="text-sm text-muted text-center mt-6">No messages yet. Say hi 👋</p>
+                )}
+                {messages.map((m) => {
+                  if (m.type === 'system') {
+                    return (
+                      <p key={m.id} className="text-xs text-subtle text-center">
+                        {m.text}
+                      </p>
+                    );
+                  }
+                  const mine = m.participant_id === userId;
+                  return (
+                    <div key={m.id} className={`flex flex-col ${mine ? 'items-end' : 'items-start'}`}>
+                      <span className="text-[11px] text-muted mb-0.5">
+                        {mine ? 'You' : m.participant_name} · {formatTime(m.created_at)}
+                      </span>
+                      <div
+                        className={`max-w-[85%] rounded-xl px-3 py-2 text-sm break-words ${
+                          mine ? 'bg-violet-500/80 text-white' : 'bg-white/10 text-text'
+                        }`}
+                      >
+                        {m.text}
+                      </div>
+                    </div>
+                  );
+                })}
+                <div ref={chatEndRef} />
+              </div>
+
+              {chatError && <p className="px-3 pb-1 text-xs text-red-400">{chatError}</p>}
+
+              <div className="p-3 border-t border-white/10 flex gap-2">
+                <input
+                  type="text"
+                  value={chatInput}
+                  maxLength={1000}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      void handleSendChat();
+                    }
+                  }}
+                  placeholder="Type a message..."
+                  className="flex-1 min-w-0 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-text placeholder:text-subtle"
+                />
+                <button
+                  type="button"
+                  onClick={() => void handleSendChat()}
+                  disabled={sending || !chatInput.trim()}
+                  className="btn-primary text-sm disabled:opacity-50"
+                >
+                  Send
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
