@@ -1,737 +1,560 @@
-// src/lib/webrtcStream.ts
-//
-// Live P2P video streaming for the watch-party room.
-//   HOST   : captures its own <video> element (captureStream) and sends the live
-//            MediaStream to every viewer over WebRTC (one RTCPeerConnection per viewer).
-//   VIEWER : receives the live MediaStream and hands the WHOLE stream to
-//            `onRemoteStream`, so the page can bind it to `video.srcObject`.
-//
-// Whatever the host does (play / pause / seek) is mirrored automatically because
-// viewers are watching the host's live output, not a downloaded file.
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import { getRoom, setVideoSource, syncPlayback, deleteRoom, type Room } from '../services/rooms';
+import { useAuth } from '../contexts/AuthContext';
+import VideoPlayer from '../components/VideoPlayer';
+import YouTubePlayer from '../components/YouTubePlayer';
+import { WebRTCStream, createRoomSignaling } from '../lib/webrtcStream';
+import { extractYouTubeId } from '../utils/youtube';
+import { USE_LOCAL } from '../lib/mode';
+import { supabase } from '../lib/supabase';
+import { subscribeLocal } from '../lib/localStore';
 
-import { USE_LOCAL } from './mode';
-import { supabase } from './supabase';
+const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+export default function WatchRoomPage() {
+  const { roomId } = useParams<{ roomId: string }>();
+  const navigate = useNavigate();
+  const { user } = useAuth();
+  const userId = user?.id;
 
-export type StreamRole = 'host' | 'viewer';
+  const [room, setRoom] = useState<Room | null>(null);
+  const [isHost, setIsHost] = useState(false);
+  const [status, setStatus] = useState('Loading room...');
+  const [error, setError] = useState<string | null>(null);
+  const [localFileName, setLocalFileName] = useState<string | null>(null);
+  const [playUrl, setPlayUrl] = useState<string | null>(null);
+  const [youtubeId, setYoutubeId] = useState<string | null>(null);
+  const [viewerCount, setViewerCount] = useState(0);
+  const [externalTime, setExternalTime] = useState<number | undefined>();
+  const [externalPlaying, setExternalPlaying] = useState<boolean | undefined>();
 
-export interface StreamCallbacks {
-  /** Viewer: fired with the complete live MediaStream (tracks already enabled). */
-  onRemoteStream?: (stream: MediaStream) => void;
-  /** Viewer: host left / stopped sharing. */
-  onRemoteStreamEnded?: () => void;
-  /** Host: number of viewers currently negotiated. */
-  onViewerCount?: (count: number) => void;
-  onConnectionState?: (state: RTCPeerConnectionState) => void;
-  onIceConnectionState?: (state: RTCIceConnectionState) => void;
-  onError?: (err: Error) => void;
-  onStatus?: (status: string) => void;
-}
+  // Viewer-side live stream state
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [hasFrame, setHasFrame] = useState(false);
+  const [viewerMuted, setViewerMuted] = useState(false);
+  const [autoplayBlocked, setAutoplayBlocked] = useState(false);
+  const [isFs, setIsFs] = useState(false);
 
-/** Every signaling message has this shape. */
-export interface SignalMessage {
-  from: string;
-  to?: string;
-  role?: StreamRole;
-  sdp?: RTCSessionDescriptionInit;
-  candidate?: RTCIceCandidateInit;
-}
+  const hostRef = useRef<WebRTCStream | null>(null);
+  const playerWrapRef = useRef<HTMLDivElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteShellRef = useRef<HTMLDivElement>(null);
+  const blobUrlRef = useRef<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const youtubeInputRef = useRef<HTMLInputElement>(null);
 
-export type SignalHandler = (payload: SignalMessage) => void;
+  // ---------------------------------------------------------------------
+  // Load room
+  // ---------------------------------------------------------------------
+  useEffect(() => {
+    if (!roomId || !user) return;
+    let cancelled = false;
 
-/** Signaling adapter – Supabase broadcast (or BroadcastChannel in local mode). */
-export interface SignalingAdapter {
-  send: (event: string, payload: SignalMessage) => void;
-  on: (event: string, handler: SignalHandler) => () => void;
-  /** Open the underlying channel (resolves once messages can flow). */
-  connect?: () => Promise<void>;
-  /** Close the underlying channel. */
-  close?: () => void;
-}
+    (async () => {
+      const r = await getRoom(roomId);
+      if (cancelled) return;
+      if (!r) {
+        setError('Room not found');
+        return;
+      }
+      setRoom(r);
+      setIsHost(r.host_id === user.id);
+      setLocalFileName(r.local_file_name);
+      setExternalTime(r.current_time);
+      setExternalPlaying(r.is_playing);
 
-export interface HostStartOptions {
-  /**
-   * Try to call video.play() before capturing (falls back to a muted play).
-   * Default false: the host presses play himself and viewers follow.
-   */
-  autoPlay?: boolean;
-}
+      if (r.video_src_type === 'youtube' && r.video_src) {
+        setYoutubeId(extractYouTubeId(r.video_src) || r.video_src);
+        setStatus('YouTube ready');
+      } else if (r.video_src_type === 'stream' && r.video_src) {
+        setPlayUrl(r.video_src);
+        setStatus('Stream ready');
+      } else {
+        setStatus(r.host_id === user.id ? 'Select a local video file to share' : 'Waiting for host to share a file...');
+      }
+    })();
 
-interface CaptureCapable {
-  captureStream?: (frameRate?: number) => MediaStream;
-  mozCaptureStream?: (frameRate?: number) => MediaStream;
-}
+    return () => {
+      cancelled = true;
+    };
+  }, [roomId, user]);
 
-interface HostPeer {
-  pc: RTCPeerConnection;
-  pendingIce: RTCIceCandidateInit[];
-}
+  // ---------------------------------------------------------------------
+  // Realtime: playback sync (YouTube / direct stream) + video source changes
+  // ---------------------------------------------------------------------
+  useEffect(() => {
+    if (!roomId || !user) return;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+    if (USE_LOCAL) {
+      const unsub = subscribeLocal((payload: any) => {
+        if (payload?.type === 'playback' && payload?.roomId?.toUpperCase() === roomId.toUpperCase()) {
+          setExternalTime(payload.current_time);
+          setExternalPlaying(payload.is_playing);
+        }
+      });
+      return unsub;
+    }
 
-const ICE_SERVERS: RTCIceServer[] = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  {
-    urls: 'turn:openrelay.metered.ca:80',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-  {
-    urls: 'turn:openrelay.metered.ca:443',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-];
+    const channel = supabase.channel(`room-sync:${roomId.toUpperCase()}`);
+    channel
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'rooms',
+          filter: `id=eq.${roomId.toUpperCase()}`,
+        },
+        (payload) => {
+          const r = payload.new as Room;
+          setExternalTime(r.current_time);
+          setExternalPlaying(r.is_playing);
+          // Let viewers follow when the host changes the video source.
+          setRoom((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  video_src_type: r.video_src_type,
+                  video_src: r.video_src,
+                  local_file_name: r.local_file_name,
+                }
+              : prev
+          );
+        }
+      )
+      .subscribe();
 
-const CAPTURE_FPS = 30;
-const CAPTURE_SETTLE_MS = 100; // let the browser initialise the captured tracks
-const MAX_VIDEO_BITRATE = 4_000_000; // 4 Mbps
-const VIEWER_RETRY_MS = 5000;
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [roomId, user]);
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+  // Viewer follows the host's choice (YouTube <-> local live stream)
+  useEffect(() => {
+    if (isHost || !room) return;
+    if (room.video_src_type === 'youtube' && room.video_src) {
+      setYoutubeId(extractYouTubeId(room.video_src) || room.video_src);
+      setRemoteStream(null);
+      setPlayUrl(null);
+    } else if (room.video_src_type === 'local') {
+      setYoutubeId(null);
+      setLocalFileName(room.local_file_name);
+    }
+  }, [isHost, room?.video_src_type, room?.video_src, room?.local_file_name]); // eslint-disable-line react-hooks/exhaustive-deps
 
-const delay = (ms: number): Promise<void> =>
-  new Promise<void>((resolve) => setTimeout(resolve, ms));
+  // ---------------------------------------------------------------------
+  // Cleanup on leave
+  // ---------------------------------------------------------------------
+  useEffect(() => {
+    return () => {
+      hostRef.current?.stop();
+      hostRef.current = null;
+      if (blobUrlRef.current) {
+        URL.revokeObjectURL(blobUrlRef.current);
+        blobUrlRef.current = null;
+      }
+    };
+  }, []);
 
-const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+  // ---------------------------------------------------------------------
+  // HOST: share a local file as a live stream
+  // ---------------------------------------------------------------------
 
-/** Wait until the element has metadata + real dimensions. */
-function waitForVideoReady(video: HTMLVideoElement, timeoutMs = 15000): Promise<void> {
-  const isReady = (): boolean =>
-    video.videoWidth > 0 && video.readyState >= HTMLMediaElement.HAVE_METADATA;
+  /** Wait until React has mounted the host's <video> with the new blob URL. */
+  const waitForHostVideo = useCallback(async (url: string): Promise<HTMLVideoElement | null> => {
+    for (let i = 0; i < 100; i++) {
+      const video = playerWrapRef.current?.querySelector('video') ?? null;
+      if (video && video.src === url) return video;
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+    return null;
+  }, []);
 
-  return new Promise<void>((resolve, reject) => {
-    if (isReady()) {
-      resolve();
+  const startHostLive = useCallback(
+    async (file: File) => {
+      if (!roomId || !userId || !isHost) return;
+
+      setError(null);
+      setYoutubeId(null);
+      setStatus('Preparing video...');
+      setLocalFileName(file.name);
+
+      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+      const url = URL.createObjectURL(file);
+      blobUrlRef.current = url;
+      setPlayUrl(url);
+
+      const video = await waitForHostVideo(url);
+      if (!video) {
+        setError('Video player failed to initialise. Please choose the file again.');
+        return;
+      }
+
+      try {
+        if (hostRef.current) {
+          await hostRef.current.replaceSource(video);
+        } else {
+          const host = new WebRTCStream('host', userId, createRoomSignaling(roomId, userId), {
+            onViewerCount: setViewerCount,
+            onError: (err) => console.error('[host stream]', err),
+          });
+          hostRef.current = host;
+          await host.startAsHost(video);
+        }
+      } catch (e) {
+        setError(errorMessage(e));
+        return;
+      }
+
+      setStatus(`Sharing "${file.name}" live — press play, viewers follow instantly`);
+      await setVideoSource(roomId, userId, 'local', undefined, file.name);
+      setRoom((prev) =>
+        prev ? { ...prev, video_src_type: 'local', local_file_name: file.name } : prev
+      );
+    },
+    [roomId, userId, isHost, waitForHostVideo]
+  );
+
+  // ---------------------------------------------------------------------
+  // VIEWER: receive the live MediaStream
+  // ---------------------------------------------------------------------
+  useEffect(() => {
+    if (isHost || !roomId || !userId || room?.video_src_type !== 'local') return;
+
+    setStatus('Waiting for host...');
+    const viewer = new WebRTCStream('viewer', userId, createRoomSignaling(roomId, userId), {
+      onRemoteStream: (stream) => {
+        setRemoteStream(stream);
+        setStatus('Live — synced with host');
+      },
+      onRemoteStreamEnded: () => {
+        setRemoteStream(null);
+        setStatus('Host stopped sharing');
+      },
+      onConnectionState: (state) => {
+        if (state === 'connected') setStatus('Live — synced with host');
+        else if (state === 'connecting') setStatus('Connecting to host...');
+        else if (state === 'failed' || state === 'disconnected') {
+          setStatus('Connection lost — reconnecting...');
+        }
+      },
+      onError: (err) => console.error('[viewer stream]', err),
+    });
+
+    void viewer.startAsViewer();
+
+    return () => {
+      viewer.stop();
+      setRemoteStream(null);
+    };
+  }, [isHost, roomId, userId, room?.video_src_type]);
+
+  /** Play the live stream; if the browser blocks autoplay, mute and retry. */
+  const playRemote = useCallback(async (video: HTMLVideoElement) => {
+    setAutoplayBlocked(false);
+    try {
+      await video.play();
+    } catch (err) {
+      const blocked = err instanceof DOMException && err.name === 'NotAllowedError';
+      if (blocked) video.muted = true; // autoplay policy: muted playback is always allowed
+      try {
+        await video.play();
+      } catch (retryErr) {
+        console.warn('[viewer] autoplay still blocked', retryErr);
+        setAutoplayBlocked(true);
+      }
+    }
+    setViewerMuted(video.muted);
+  }, []);
+
+  // Bind the MediaStream directly to <video>.srcObject (no blob / playUrl)
+  useEffect(() => {
+    const video = remoteVideoRef.current;
+    if (!video) return;
+
+    if (!remoteStream) {
+      video.srcObject = null;
       return;
     }
 
-    const events = ['loadedmetadata', 'loadeddata', 'canplay', 'playing'] as const;
+    setHasFrame(false);
+    video.srcObject = remoteStream;
+    void playRemote(video);
 
-    const cleanup = (): void => {
-      clearTimeout(timer);
-      events.forEach((ev) => video.removeEventListener(ev, onReady));
-      video.removeEventListener('error', onError);
+    return () => {
+      video.srcObject = null;
     };
+  }, [remoteStream, playRemote]);
 
-    const onReady = (): void => {
-      if (isReady()) {
-        cleanup();
-        resolve();
-      }
-    };
+  useEffect(() => {
+    const onFs = () => setIsFs(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', onFs);
+    return () => document.removeEventListener('fullscreenchange', onFs);
+  }, []);
 
-    const onError = (): void => {
-      cleanup();
-      reject(new Error(video.error?.message || 'Video failed to load'));
-    };
-
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(
-        new Error(
-          'Video metadata did not load in time. The file codec may not be supported by this browser (MKV / H.265?). Try an H.264 MP4.'
-        )
-      );
-    }, timeoutMs);
-
-    events.forEach((ev) => video.addEventListener(ev, onReady));
-    video.addEventListener('error', onError);
-  });
-}
-
-/** play() with a muted fallback (host side, only used when autoPlay is requested). */
-async function safePlay(video: HTMLVideoElement): Promise<void> {
-  try {
-    await video.play();
-  } catch {
-    const wasMuted = video.muted;
-    video.muted = true;
-    try {
-      await video.play();
-    } finally {
-      video.muted = wasMuted;
-    }
-  }
-}
-
-/** Capture the element's output as a live MediaStream with all tracks enabled. */
-function captureFromVideo(video: HTMLVideoElement): MediaStream {
-  const el = video as unknown as CaptureCapable;
-  const capture = el.captureStream ?? el.mozCaptureStream;
-  if (typeof capture !== 'function') {
-    throw new Error('captureStream() is not supported in this browser. Use Chrome, Edge or Firefox.');
-  }
-
-  const stream = capture.call(video, CAPTURE_FPS);
-  stream.getTracks().forEach((track) => {
-    track.enabled = true;
-  });
-
-  if (stream.getVideoTracks().length === 0) {
-    stream.getTracks().forEach((track) => track.stop());
-    throw new Error('No video track could be captured. The file codec is probably unsupported (try H.264 MP4).');
-  }
-  return stream;
-}
-
-// ---------------------------------------------------------------------------
-// Room signaling (Supabase broadcast, or BroadcastChannel when USE_LOCAL)
-// ---------------------------------------------------------------------------
-
-export function createRoomSignaling(roomId: string, userId: string): SignalingAdapter {
-  const channelName = `cc-live:${roomId.toUpperCase()}`;
-  const handlers = new Map<string, Set<SignalHandler>>();
-  let bc: BroadcastChannel | null = null;
-  let sb: ReturnType<typeof supabase.channel> | null = null;
-  let ready = false;
-
-  const dispatch = (event: string, payload: SignalMessage | undefined): void => {
-    if (!payload || payload.from === userId) return;
-    handlers.get(event)?.forEach((handler) => {
-      try {
-        handler(payload);
-      } catch (e) {
-        console.error('[signaling] handler error', event, e);
-      }
-    });
+  const toggleViewerMute = () => {
+    const video = remoteVideoRef.current;
+    if (!video) return;
+    video.muted = !video.muted;
+    setViewerMuted(video.muted);
+    if (video.paused) void playRemote(video);
   };
 
-  return {
-    send(event, payload) {
-      if (USE_LOCAL) {
-        bc?.postMessage({ event, payload });
-        return;
-      }
-      if (sb && ready) {
-        void sb.send({ type: 'broadcast', event: 'live', payload: { event, data: payload } });
-      }
-    },
-
-    on(event, handler) {
-      let set = handlers.get(event);
-      if (!set) {
-        set = new Set<SignalHandler>();
-        handlers.set(event, set);
-      }
-      set.add(handler);
-      return () => {
-        set?.delete(handler);
-      };
-    },
-
-    async connect() {
-      if (USE_LOCAL) {
-        if (typeof BroadcastChannel === 'undefined') return;
-        bc = new BroadcastChannel(channelName);
-        bc.onmessage = (e: MessageEvent) => {
-          const msg = e.data as { event?: string; payload?: SignalMessage } | null;
-          if (msg && typeof msg.event === 'string') dispatch(msg.event, msg.payload);
-        };
-        ready = true;
-        return;
-      }
-
-      const channel = supabase.channel(channelName, { config: { broadcast: { self: false } } });
-      sb = channel;
-      channel.on('broadcast', { event: 'live' }, ({ payload }) => {
-        const msg = payload as { event?: string; data?: SignalMessage } | null;
-        if (msg && typeof msg.event === 'string') dispatch(msg.event, msg.data);
-      });
-
-      await new Promise<void>((resolve) => {
-        channel.subscribe((status) => {
-          if (status === 'SUBSCRIBED') {
-            ready = true;
-            resolve();
-          } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-            console.error('[signaling] channel status', status);
-            resolve();
-          }
-        });
-      });
-    },
-
-    close() {
-      handlers.clear();
-      bc?.close();
-      bc = null;
-      if (sb) {
-        void supabase.removeChannel(sb);
-        sb = null;
-      }
-      ready = false;
-    },
+  const toggleViewerFullscreen = async () => {
+    const el = remoteShellRef.current;
+    if (!el) return;
+    try {
+      if (!document.fullscreenElement) await el.requestFullscreen();
+      else await document.exitFullscreen();
+    } catch {
+      /* ignore */
+    }
   };
-}
 
-// ---------------------------------------------------------------------------
-// WebRTCStream
-// ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------------
+  // Handlers
+  // ---------------------------------------------------------------------
+  const handleLocalFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const input = e.target;
+    const file = input.files?.[0];
+    if (!file) return;
+    await startHostLive(file);
+    input.value = '';
+  };
 
-export class WebRTCStream {
-  private readonly role: StreamRole;
-  private readonly userId: string;
-  private readonly signaling: SignalingAdapter;
-  private readonly callbacks: StreamCallbacks;
-
-  private unsubscribers: Array<() => void> = [];
-  private stopped = false;
-
-  // host state
-  private localStream: MediaStream | null = null;
-  private readonly peers = new Map<string, HostPeer>();
-  private readonly connecting = new Set<string>();
-
-  // viewer state
-  private pc: RTCPeerConnection | null = null;
-  private pendingIce: RTCIceCandidateInit[] = [];
-  private remoteStream: MediaStream | null = null;
-  private retryTimer: ReturnType<typeof setInterval> | null = null;
-
-  constructor(
-    role: StreamRole,
-    userId: string,
-    signaling: SignalingAdapter,
-    callbacks: StreamCallbacks = {}
-  ) {
-    this.role = role;
-    this.userId = userId;
-    this.signaling = signaling;
-    this.callbacks = callbacks;
-  }
-
-  // ======================================================================
-  // HOST
-  // ======================================================================
-
-  /** Start sharing `videoElement`. Safe to call once; use replaceSource() afterwards. */
-  async startAsHost(videoElement: HTMLVideoElement, options: HostStartOptions = {}): Promise<void> {
-    this.assertRole('host');
-    this.stopped = false;
-    this.callbacks.onStatus?.('preparing-video');
-
-    // Listen first so no viewer request is missed while we prepare the video.
-    this.wireHostSignaling();
-    await this.signaling.connect?.();
-
-    try {
-      await this.attachSource(videoElement, options);
-    } catch (e) {
-      const err = e instanceof Error ? e : new Error(errMsg(e));
-      this.callbacks.onError?.(err);
-      throw err;
+  const handleYouTubeSubmit = async () => {
+    if (!isHost || !roomId || !user || !youtubeInputRef.current) return;
+    const raw = youtubeInputRef.current.value.trim();
+    const id = extractYouTubeId(raw);
+    if (!id) {
+      setError('Invalid YouTube URL or ID');
+      return;
     }
-    this.callbacks.onStatus?.('streaming');
-  }
+    setError(null);
+    hostRef.current?.stop();
+    hostRef.current = null;
+    setViewerCount(0);
+    setYoutubeId(id);
+    setPlayUrl(null);
+    setStatus('YouTube loaded');
+    await setVideoSource(roomId, user.id, 'youtube', id);
+    setRoom((prev) => (prev ? { ...prev, video_src_type: 'youtube', video_src: id } : prev));
+  };
 
-  /**
-   * Host picked another file: capture the element again and make every viewer
-   * reconnect to the new stream.
-   */
-  async replaceSource(videoElement: HTMLVideoElement, options: HostStartOptions = {}): Promise<void> {
-    this.assertRole('host');
-    try {
-      await this.attachSource(videoElement, options);
-    } catch (e) {
-      const err = e instanceof Error ? e : new Error(errMsg(e));
-      this.callbacks.onError?.(err);
-      throw err;
+  const handleDeleteRoom = async () => {
+    if (!roomId || !user) return;
+    if (!confirm('Delete this room?')) return;
+    const { error: delError } = await deleteRoom(roomId, user.id);
+    if (delError) {
+      alert(delError);
+      return;
     }
-    this.callbacks.onStatus?.('source-replaced');
-  }
+    navigate('/');
+  };
 
-  private async attachSource(video: HTMLVideoElement, options: HostStartOptions): Promise<void> {
-    if (options.autoPlay && video.paused) {
-      await safePlay(video);
-    }
+  const onPlayState = useCallback(
+    (playing: boolean, time: number) => {
+      if (!isHost || !roomId || !user) return;
+      void syncPlayback(roomId, user.id, playing, time);
+    },
+    [isHost, roomId, user]
+  );
 
-    await waitForVideoReady(video);
-    // Race-condition guard: give the browser a moment to initialise the tracks.
-    await delay(CAPTURE_SETTLE_MS);
-
-    let next: MediaStream | null = null;
-    for (let attempt = 0; attempt < 3 && !next; attempt++) {
-      try {
-        next = captureFromVideo(video);
-      } catch (e) {
-        if (attempt === 2) throw e;
-        await delay(150);
-      }
-    }
-    if (!next) throw new Error('Could not capture the video stream.');
-
-    const previous = this.localStream;
-    this.localStream = next;
-
-    this.closeAllPeers();
-    previous?.getTracks().forEach((track) => track.stop());
-
-    // First source -> "host-ready". Later sources -> force viewers to reconnect.
-    this.signaling.send(previous ? 'source-changed' : 'host-ready', {
-      from: this.userId,
-      role: 'host',
-    });
-  }
-
-  private wireHostSignaling(): void {
-    this.clearSignaling();
-
-    this.unsubscribers.push(
-      this.signaling.on('need-stream', (m) => {
-        void this.createPeerForViewer(m.from);
-      }),
-      this.signaling.on('answer', (m) => {
-        void this.handleHostAnswer(m);
-      }),
-      this.signaling.on('ice-candidate', (m) => {
-        void this.handleHostIce(m);
-      }),
-      this.signaling.on('goodbye', (m) => {
-        if (m.role === 'viewer') this.closePeer(m.from);
-      })
+  // ---------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-obsidian pt-24 flex items-center justify-center text-muted">
+        Please sign in to join a room.
+      </div>
     );
   }
 
-  private async createPeerForViewer(viewerId: string): Promise<void> {
-    const stream = this.localStream;
-    if (!stream || this.stopped || this.connecting.has(viewerId)) return;
-
-    this.connecting.add(viewerId);
-    try {
-      this.closePeer(viewerId);
-
-      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-      this.peers.set(viewerId, { pc, pendingIce: [] });
-      this.callbacks.onViewerCount?.(this.peers.size);
-
-      stream.getTracks().forEach((track) => {
-        track.enabled = true;
-        pc.addTrack(track, stream);
-      });
-
-      pc.onicecandidate = (ev) => {
-        if (ev.candidate) {
-          this.signaling.send('ice-candidate', {
-            from: this.userId,
-            to: viewerId,
-            role: 'host',
-            candidate: ev.candidate.toJSON(),
-          });
-        }
-      };
-
-      pc.onconnectionstatechange = () => {
-        if (this.peers.get(viewerId)?.pc !== pc) return;
-        this.callbacks.onConnectionState?.(pc.connectionState);
-        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-          this.closePeer(viewerId);
-        }
-      };
-
-      pc.oniceconnectionstatechange = () => {
-        if (this.peers.get(viewerId)?.pc === pc) {
-          this.callbacks.onIceConnectionState?.(pc.iceConnectionState);
-        }
-      };
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      this.signaling.send('offer', {
-        from: this.userId,
-        to: viewerId,
-        role: 'host',
-        sdp: pc.localDescription?.toJSON() ?? offer,
-      });
-
-      this.tuneSenders(pc);
-    } catch (e) {
-      console.error('[host] failed to create peer', e);
-      this.callbacks.onError?.(e instanceof Error ? e : new Error(errMsg(e)));
-      this.closePeer(viewerId);
-    } finally {
-      this.connecting.delete(viewerId);
-    }
-  }
-
-  private async handleHostAnswer(m: SignalMessage): Promise<void> {
-    if (m.to !== this.userId || !m.sdp) return;
-    const entry = this.peers.get(m.from);
-    if (!entry || entry.pc.currentRemoteDescription) return;
-
-    try {
-      await entry.pc.setRemoteDescription(m.sdp);
-      const queued = entry.pendingIce.splice(0);
-      for (const candidate of queued) {
-        try {
-          await entry.pc.addIceCandidate(candidate);
-        } catch {
-          /* stale candidate */
-        }
-      }
-    } catch (e) {
-      console.error('[host] setRemoteDescription failed', e);
-    }
-  }
-
-  private async handleHostIce(m: SignalMessage): Promise<void> {
-    if (m.to !== this.userId || !m.candidate) return;
-    const entry = this.peers.get(m.from);
-    if (!entry) return;
-
-    if (entry.pc.remoteDescription) {
-      try {
-        await entry.pc.addIceCandidate(m.candidate);
-      } catch {
-        /* stale candidate */
-      }
-    } else {
-      entry.pendingIce.push(m.candidate);
-    }
-  }
-
-  /** Smooth framerate for movies + a sensible bitrate cap. */
-  private tuneSenders(pc: RTCPeerConnection): void {
-    pc.getSenders().forEach((sender) => {
-      const track = sender.track;
-      if (!track || track.kind !== 'video') return;
-
-      try {
-        (track as MediaStreamTrack & { contentHint?: string }).contentHint = 'motion';
-      } catch {
-        /* not supported */
-      }
-
-      const params = sender.getParameters();
-      if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
-      params.encodings[0].maxBitrate = MAX_VIDEO_BITRATE;
-      params.encodings[0].maxFramerate = CAPTURE_FPS;
-      sender.setParameters(params).catch(() => {
-        /* browser may reject – harmless */
-      });
-    });
-  }
-
-  private closePeer(viewerId: string): void {
-    const entry = this.peers.get(viewerId);
-    if (!entry) return;
-    entry.pc.onicecandidate = null;
-    entry.pc.onconnectionstatechange = null;
-    entry.pc.oniceconnectionstatechange = null;
-    entry.pc.close();
-    this.peers.delete(viewerId);
-    this.callbacks.onViewerCount?.(this.peers.size);
-  }
-
-  private closeAllPeers(): void {
-    Array.from(this.peers.keys()).forEach((id) => this.closePeer(id));
-  }
-
-  // ======================================================================
-  // VIEWER
-  // ======================================================================
-
-  async startAsViewer(): Promise<void> {
-    this.assertRole('viewer');
-    this.stopped = false;
-    this.callbacks.onStatus?.('waiting-for-host');
-
-    this.wireViewerSignaling();
-    await this.signaling.connect?.();
-
-    this.requestStream();
-    this.retryTimer = setInterval(() => {
-      if (this.stopped) return;
-      const state = this.pc?.connectionState;
-      if (!this.pc || state === 'failed' || state === 'closed') this.requestStream();
-    }, VIEWER_RETRY_MS);
-  }
-
-  private requestStream(): void {
-    if (this.stopped) return;
-    this.signaling.send('need-stream', { from: this.userId, role: 'viewer' });
-    this.callbacks.onStatus?.('requesting');
-  }
-
-  private wireViewerSignaling(): void {
-    this.clearSignaling();
-
-    this.unsubscribers.push(
-      this.signaling.on('offer', (m) => {
-        void this.handleViewerOffer(m);
-      }),
-      this.signaling.on('ice-candidate', (m) => {
-        void this.handleViewerIce(m);
-      }),
-      this.signaling.on('host-ready', () => {
-        const state = this.pc?.connectionState;
-        if (!this.pc || state === 'failed' || state === 'closed') this.requestStream();
-      }),
-      this.signaling.on('source-changed', () => {
-        this.requestStream();
-      }),
-      this.signaling.on('goodbye', (m) => {
-        if (m.role !== 'host') return;
-        this.closeViewerPc();
-        this.remoteStream = null;
-        this.callbacks.onStatus?.('host-left');
-        this.callbacks.onRemoteStreamEnded?.();
-      })
+  if (error && !room) {
+    return (
+      <div className="min-h-screen bg-obsidian pt-24 flex items-center justify-center text-red-400">
+        {error}
+      </div>
     );
   }
 
-  private async handleViewerOffer(m: SignalMessage): Promise<void> {
-    if (m.to !== this.userId || !m.sdp || this.stopped) return;
+  return (
+    <div className="min-h-screen bg-obsidian pt-20 pb-12 px-4">
+      <div className="max-w-5xl mx-auto">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h1 className="font-display text-2xl font-semibold text-text">
+              Room {roomId?.toUpperCase()}
+            </h1>
+            <p className="text-sm text-muted">
+              {room?.movie_title || 'Watch together'} · {isHost ? 'You are host' : `Host: ${room?.host_name}`}
+            </p>
+          </div>
 
-    try {
-      this.closeViewerPc();
-      this.remoteStream = null;
+          <div className="flex items-center">
+            <button onClick={() => navigate('/')} className="text-sm text-muted hover:text-text">
+              Leave
+            </button>
+            {isHost && (
+              <button
+                onClick={handleDeleteRoom}
+                className="text-sm text-red-400 hover:text-red-300 ml-3"
+              >
+                Delete Room
+              </button>
+            )}
+          </div>
+        </div>
 
-      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-      this.pc = pc;
+        <div className="glass rounded-xl p-3 mb-4 text-sm">
+          <div className="flex items-center justify-between">
+            <span className="text-violet-light">{status}</span>
+            {isHost && room?.video_src_type === 'local' && (
+              <span className="text-muted">{viewerCount} viewer(s)</span>
+            )}
+          </div>
+          {error && <p className="text-red-400 mt-1">{error}</p>}
+        </div>
 
-      pc.ontrack = (ev: RTCTrackEvent) => {
-        if (this.pc !== pc) return;
+        {isHost && (
+          <div className="glass rounded-xl p-4 mb-4 space-y-3">
+            <p className="text-xs mono-label text-muted">Share a video</p>
+            <div className="flex flex-col sm:flex-row gap-3">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="btn-primary text-sm"
+              >
+                {localFileName ? `Change file (${localFileName})` : 'Choose local video file'}
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="video/*,.mp4,.webm,.mkv,.mov,.m4v,.avi"
+                className="hidden"
+                onChange={handleLocalFile}
+              />
+              <div className="flex-1 flex gap-2">
+                <input
+                  ref={youtubeInputRef}
+                  type="text"
+                  placeholder="Or paste YouTube URL / ID"
+                  className="flex-1 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-text placeholder:text-subtle"
+                  onKeyDown={(e) => e.key === 'Enter' && handleYouTubeSubmit()}
+                />
+                <button type="button" onClick={handleYouTubeSubmit} className="btn-secondary text-sm">
+                  Load YT
+                </button>
+              </div>
+            </div>
+            <p className="text-xs text-subtle">
+              Local files are streamed live, peer-to-peer (never uploaded to a server). Play, pause and seek are
+              mirrored on every viewer instantly. Keep this tab open while sharing. Prefer MP4 (H.264) for best
+              compatibility.
+            </p>
+          </div>
+        )}
 
-        const incoming = ev.streams[0];
-        if (incoming) {
-          this.remoteStream = incoming;
-        } else {
-          // Sender did not attach a stream id: build one ourselves.
-          if (!this.remoteStream) this.remoteStream = new MediaStream();
-          if (!this.remoteStream.getTracks().includes(ev.track)) {
-            this.remoteStream.addTrack(ev.track);
-          }
-        }
+        <div
+          ref={playerWrapRef}
+          className="aspect-video bg-black/40 rounded-2xl overflow-hidden mb-6 relative"
+        >
+          {youtubeId ? (
+            <YouTubePlayer
+              videoId={youtubeId}
+              externalTime={isHost ? undefined : externalTime}
+              externalPlaying={isHost ? undefined : externalPlaying}
+              onPlayState={onPlayState}
+              className="w-full h-full"
+            />
+          ) : !isHost && remoteStream ? (
+            <div ref={remoteShellRef} className="relative w-full h-full bg-black">
+              <video
+                ref={remoteVideoRef}
+                className="w-full h-full object-contain bg-black"
+                autoPlay
+                playsInline
+                onLoadedData={() => setHasFrame(true)}
+                onPlaying={() => setHasFrame(true)}
+                onVolumeChange={(e) => setViewerMuted(e.currentTarget.muted)}
+              />
 
-        ev.track.enabled = true;
-        this.remoteStream.getTracks().forEach((track) => {
-          track.enabled = true;
-        });
+              {!hasFrame && !autoplayBlocked && (
+                <div className="absolute inset-0 flex items-center justify-center text-muted text-sm bg-black/60 pointer-events-none">
+                  Waiting for host to press play...
+                </div>
+              )}
 
-        this.callbacks.onRemoteStream?.(this.remoteStream);
-        this.callbacks.onStatus?.('receiving');
-      };
+              {autoplayBlocked && (
+                <button
+                  type="button"
+                  onClick={() => remoteVideoRef.current && void playRemote(remoteVideoRef.current)}
+                  className="absolute inset-0 flex items-center justify-center bg-black/60"
+                >
+                  <span className="btn-primary text-sm">▶ Click to start watching</span>
+                </button>
+              )}
 
-      pc.onicecandidate = (ev) => {
-        if (ev.candidate) {
-          this.signaling.send('ice-candidate', {
-            from: this.userId,
-            to: m.from,
-            role: 'viewer',
-            candidate: ev.candidate.toJSON(),
-          });
-        }
-      };
+              {viewerMuted && hasFrame && !autoplayBlocked && (
+                <button
+                  type="button"
+                  onClick={toggleViewerMute}
+                  className="absolute top-3 left-3 btn-primary text-xs"
+                >
+                  🔊 Tap to unmute
+                </button>
+              )}
 
-      pc.onconnectionstatechange = () => {
-        if (this.pc !== pc) return;
-        this.callbacks.onConnectionState?.(pc.connectionState);
-        if (pc.connectionState === 'failed') {
-          this.callbacks.onError?.(new Error('Peer connection failed'));
-        }
-      };
+              <div className="absolute top-3 right-3 text-[11px] text-white/80 bg-black/50 rounded px-2 py-0.5">
+                ● LIVE · synced with host
+              </div>
 
-      pc.oniceconnectionstatechange = () => {
-        if (this.pc === pc) this.callbacks.onIceConnectionState?.(pc.iceConnectionState);
-      };
+              <div className="absolute bottom-3 right-3 flex gap-2">
+                <button
+                  type="button"
+                  onClick={toggleViewerMute}
+                  className="text-white/90 hover:text-white text-xs bg-black/50 rounded px-2 py-1"
+                >
+                  {viewerMuted ? 'Unmute' : 'Mute'}
+                </button>
+                <button
+                  type="button"
+                  onClick={toggleViewerFullscreen}
+                  className="text-white/90 hover:text-white text-xs bg-black/50 rounded px-2 py-1"
+                >
+                  {isFs ? 'Exit fullscreen' : 'Fullscreen'}
+                </button>
+              </div>
+            </div>
+          ) : playUrl ? (
+            <VideoPlayer
+              src={playUrl}
+              title={localFileName || room?.movie_title || 'Video'}
+              isHost={isHost}
+              externalTime={isHost ? undefined : externalTime}
+              externalPlaying={isHost ? undefined : externalPlaying}
+              onPlayState={onPlayState}
+              className="w-full h-full"
+            />
+          ) : (
+            <div className="w-full h-full flex items-center justify-center text-muted text-sm">
+              {isHost
+                ? 'Select a local file or paste a YouTube link to start'
+                : 'Waiting for host to share a video...'}
+            </div>
+          )}
+        </div>
 
-      this.callbacks.onStatus?.('connecting');
-      await pc.setRemoteDescription(m.sdp);
-
-      const queued = this.pendingIce.splice(0);
-      for (const candidate of queued) {
-        try {
-          await pc.addIceCandidate(candidate);
-        } catch {
-          /* stale candidate */
-        }
-      }
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      this.signaling.send('answer', {
-        from: this.userId,
-        to: m.from,
-        role: 'viewer',
-        sdp: pc.localDescription?.toJSON() ?? answer,
-      });
-    } catch (e) {
-      console.error('[viewer] offer handling failed', e);
-      this.callbacks.onError?.(e instanceof Error ? e : new Error(errMsg(e)));
-    }
-  }
-
-  private async handleViewerIce(m: SignalMessage): Promise<void> {
-    if (m.to !== this.userId || !m.candidate) return;
-
-    if (this.pc && this.pc.remoteDescription) {
-      try {
-        await this.pc.addIceCandidate(m.candidate);
-      } catch {
-        /* stale candidate */
-      }
-    } else {
-      this.pendingIce.push(m.candidate);
-    }
-  }
-
-  private closeViewerPc(): void {
-    if (this.pc) {
-      this.pc.ontrack = null;
-      this.pc.onicecandidate = null;
-      this.pc.onconnectionstatechange = null;
-      this.pc.oniceconnectionstatechange = null;
-      this.pc.close();
-      this.pc = null;
-    }
-    this.pendingIce = [];
-  }
-
-  // ======================================================================
-  // Shared
-  // ======================================================================
-
-  stop(): void {
-    this.stopped = true;
-
-    if (this.retryTimer) {
-      clearInterval(this.retryTimer);
-      this.retryTimer = null;
-    }
-
-    // Tell the other side we are leaving, then tear everything down.
-    this.signaling.send('goodbye', { from: this.userId, role: this.role });
-
-    this.clearSignaling();
-    this.closeAllPeers();
-    this.closeViewerPc();
-
-    this.localStream?.getTracks().forEach((track) => track.stop());
-    this.localStream = null;
-    this.remoteStream = null;
-
-    // Give the "goodbye" broadcast a moment to flush before closing the channel.
-    const signaling = this.signaling;
-    setTimeout(() => signaling.close?.(), 300);
-  }
-
-  private clearSignaling(): void {
-    this.unsubscribers.forEach((unsubscribe) => unsubscribe());
-    this.unsubscribers = [];
-  }
-
-  private assertRole(expected: StreamRole): void {
-    if (this.role !== expected) {
-      throw new Error(`This method is only available for the ${expected} role`);
-    }
-  }
+        {!youtubeId && room?.video_src_type === 'local' && (
+          <div className="text-xs text-subtle space-y-1">
+            <p>• Host controls playback — play, pause and seek are mirrored live on every viewer.</p>
+            <p>• If the browser blocks sound, the video starts muted — tap “Unmute” once.</p>
+            <p>• Quality depends on the host’s upload speed. MP4 (H.264 + AAC) works best.</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
