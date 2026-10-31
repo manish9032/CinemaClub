@@ -25,8 +25,8 @@ import { subscribeLocal } from '../lib/localStore';
 
 const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
-const formatTime = (iso: string): string =>
-  new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+/** How long a new chat message stays on the video before it fades away. */
+const OVERLAY_VISIBLE_MS = 15000;
 
 /** Stable avatar colour per name (like YouTube live chat). */
 const avatarColor = (name: string): string => {
@@ -68,16 +68,18 @@ export default function WatchRoomPage() {
   const [sending, setSending] = useState(false);
   const [unread, setUnread] = useState(0);
   const [chatOpen, setChatOpen] = useState(true);
-  const [showJump, setShowJump] = useState(false);
+  const [inputFocused, setInputFocused] = useState(false);
+  const [, setTick] = useState(0);
+  const [showInvite, setShowInvite] = useState(false);
+  const [copied, setCopied] = useState<'code' | 'link' | null>(null);
 
   const hostRef = useRef<WebRTCStream | null>(null);
   const playerWrapRef = useRef<HTMLDivElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const remoteShellRef = useRef<HTMLDivElement>(null);
   const blobUrlRef = useRef<string | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const atBottomRef = useRef(true);
   const chatOpenRef = useRef(true);
+  const arrivedAtRef = useRef<Map<string, number>>(new Map());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const youtubeInputRef = useRef<HTMLInputElement>(null);
 
@@ -185,10 +187,7 @@ export default function WatchRoomPage() {
   // ---------------------------------------------------------------------
   useEffect(() => {
     chatOpenRef.current = chatOpen;
-    if (chatOpen) {
-      setUnread(0);
-      atBottomRef.current = true;
-    }
+    if (chatOpen) setUnread(0);
   }, [chatOpen]);
 
   // Initial load
@@ -215,6 +214,7 @@ export default function WatchRoomPage() {
     const id = roomId.toUpperCase();
 
     const addMessage = (msg: RoomMessage) => {
+      if (!arrivedAtRef.current.has(msg.id)) arrivedAtRef.current.set(msg.id, Date.now());
       setMessages((prev) => (prev.some((x) => x.id === msg.id) ? prev : [...prev, msg]));
       if (!chatOpenRef.current && msg.type === 'message' && msg.participant_id !== userId) {
         setUnread((n) => n + 1);
@@ -254,33 +254,17 @@ export default function WatchRoomPage() {
     };
   }, [roomId, userId]);
 
-  // YouTube-style autoscroll: stick to the newest message unless the user scrolled up
+  // Re-render every second so overlay messages can fade out
   useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    if (atBottomRef.current) {
-      el.scrollTop = el.scrollHeight;
-      setShowJump(false);
-    } else {
-      setShowJump(true);
-    }
-  }, [messages, chatOpen]);
+    if (!chatOpen) return;
+    const timer = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(timer);
+  }, [chatOpen]);
 
-  const handleChatScroll = () => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-    atBottomRef.current = nearBottom;
-    if (nearBottom) setShowJump(false);
-  };
-
-  const jumpToLatest = () => {
-    const el = scrollRef.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
-    atBottomRef.current = true;
-    setShowJump(false);
-  };
+  // The host sees the invite card right after creating the room
+  useEffect(() => {
+    if (isHost) setShowInvite(true);
+  }, [isHost]);
 
   const myName = participants.find((p) => p.user_id === userId)?.name || displayName;
 
@@ -288,17 +272,72 @@ export default function WatchRoomPage() {
     const text = chatInput.trim();
     if (!text || !roomId || !userId || sending) return;
     setSending(true);
-    atBottomRef.current = true;
     setChatError(null);
     setChatInput('');
     const msg = await sendMessage(roomId, userId, myName, text);
     if (msg) {
+      if (!arrivedAtRef.current.has(msg.id)) arrivedAtRef.current.set(msg.id, Date.now());
       setMessages((prev) => (prev.some((x) => x.id === msg.id) ? prev : [...prev, msg]));
     } else {
       setChatInput(text);
       setChatError('Message could not be sent. Please try again.');
     }
     setSending(false);
+  };
+
+  const roomCode = roomId?.toUpperCase() ?? '';
+  const shareLink = `${window.location.origin}${window.location.pathname}#/join/${roomCode}`;
+  const inviteText = `Join my CinemaClub watch party!\nRoom code: ${roomCode}\n${shareLink}`;
+
+  const copyText = async (text: string): Promise<boolean> => {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try {
+        ok = document.execCommand('copy');
+      } catch {
+        ok = false;
+      }
+      document.body.removeChild(ta);
+      return ok;
+    }
+  };
+
+  const flashCopied = (what: 'code' | 'link') => {
+    setCopied(what);
+    setTimeout(() => setCopied(null), 1800);
+  };
+
+  const copyCode = async () => {
+    if (await copyText(roomCode)) flashCopied('code');
+  };
+
+  const copyLink = async () => {
+    if (await copyText(shareLink)) flashCopied('link');
+  };
+
+  const shareInvite = async () => {
+    if (typeof navigator.share === 'function') {
+      try {
+        await navigator.share({
+          title: 'CinemaClub — Watch Together',
+          text: `Join my CinemaClub watch party! Room code: ${roomCode}`,
+          url: shareLink,
+        });
+      } catch {
+        /* share sheet closed */
+      }
+      return;
+    }
+    await copyLink();
   };
 
   const handleLeave = async () => {
@@ -549,13 +588,137 @@ export default function WatchRoomPage() {
     );
   }
 
+  const nowMs = Date.now();
+  const visibleMessages = messages
+    .filter((m) => m.type === 'message')
+    .filter((m) => {
+      if (inputFocused) return true;
+      const arrived = arrivedAtRef.current.get(m.id);
+      return arrived !== undefined && nowMs - arrived < OVERLAY_VISIBLE_MS;
+    })
+    .slice(inputFocused ? -10 : -6);
+
+  const fadeMask = {
+    WebkitMaskImage: 'linear-gradient(to bottom, transparent, black 30%)',
+    maskImage: 'linear-gradient(to bottom, transparent, black 30%)',
+  };
+
+  /** Live-stream style chat: messages float on the right side of the video. */
+  const chatOverlay = chatOpen ? (
+    <div className="absolute right-3 top-12 bottom-[84px] w-[min(300px,52%)] z-20 flex flex-col justify-end gap-2 pointer-events-none">
+      <div className="flex flex-col justify-end gap-1.5 overflow-hidden" style={fadeMask}>
+        {visibleMessages.map((m) => {
+          const arrived = arrivedAtRef.current.get(m.id);
+          const age = arrived === undefined ? 0 : nowMs - arrived;
+          const fading = !inputFocused && age > OVERLAY_VISIBLE_MS - 4000;
+          const fromHost = !!room?.host_id && m.participant_id === room.host_id;
+          return (
+            <div
+              key={m.id}
+              className="flex items-start gap-1.5 w-fit max-w-full rounded-xl bg-black/50 backdrop-blur-sm px-2 py-1 text-[13px] leading-snug text-white transition-opacity duration-1000"
+              style={{ opacity: fading ? 0.35 : 1 }}
+            >
+              <span
+                className="w-5 h-5 shrink-0 rounded-full flex items-center justify-center text-[10px] font-semibold text-white"
+                style={{ backgroundColor: avatarColor(m.participant_name) }}
+              >
+                {m.participant_name.charAt(0).toUpperCase()}
+              </span>
+              <p className="min-w-0 break-words">
+                <span className={`font-semibold mr-1.5 ${fromHost ? 'text-violet-light' : 'text-white/70'}`}>
+                  {m.participant_name}
+                </span>
+                <span>{m.text}</span>
+              </p>
+            </div>
+          );
+        })}
+      </div>
+
+      {chatError && (
+        <p className="pointer-events-auto text-[11px] text-red-300 bg-black/60 rounded px-2 py-1">{chatError}</p>
+      )}
+
+      <div
+        className="pointer-events-auto flex items-center gap-1.5 rounded-full bg-black/55 backdrop-blur-sm border border-white/15 pl-3 pr-1 py-1"
+        onDoubleClick={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <input
+          type="text"
+          value={chatInput}
+          maxLength={1000}
+          onChange={(e) => setChatInput(e.target.value)}
+          onFocus={() => setInputFocused(true)}
+          onBlur={() => setInputFocused(false)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              void handleSendChat();
+            }
+          }}
+          placeholder="Say something..."
+          className="flex-1 min-w-0 bg-transparent outline-none text-[13px] text-white placeholder:text-white/50"
+        />
+        <button
+          type="button"
+          onClick={() => void handleSendChat()}
+          disabled={sending || !chatInput.trim()}
+          aria-label="Send message"
+          className="w-7 h-7 shrink-0 rounded-full bg-violet-500 text-white text-xs flex items-center justify-center disabled:opacity-40"
+        >
+          ➤
+        </button>
+        <button
+          type="button"
+          onClick={() => setChatOpen(false)}
+          aria-label="Hide chat"
+          title="Hide chat"
+          className="w-7 h-7 shrink-0 rounded-full text-white/70 hover:text-white text-xs flex items-center justify-center"
+        >
+          ✕
+        </button>
+      </div>
+    </div>
+  ) : (
+    <button
+      type="button"
+      onClick={() => setChatOpen(true)}
+      title="Show chat"
+      aria-label="Show chat"
+      className="absolute right-3 bottom-[88px] z-20 w-10 h-10 rounded-full bg-black/60 border border-white/15 text-white flex items-center justify-center"
+    >
+      💬
+      {unread > 0 && (
+        <span className="absolute -top-1 -right-1 min-w-5 h-5 px-1 rounded-full bg-violet-500 text-white text-[11px] flex items-center justify-center">
+          {unread}
+        </span>
+      )}
+    </button>
+  );
+
+  const viewingLive = !youtubeId && !isHost && !!remoteStream;
+  const viewingFile = !youtubeId && !viewingLive && !!playUrl;
+  // YouTube iframe / empty player: draw the overlay on the wrapper itself
+  const overlayInWrapper = !viewingLive && !viewingFile;
+
   return (
     <div className="min-h-screen bg-obsidian pt-20 pb-12 px-4">
       <div className="max-w-5xl mx-auto">
         <div className="flex items-center justify-between mb-4">
           <div>
-            <h1 className="font-display text-2xl font-semibold text-text">
-              Room {roomId?.toUpperCase()}
+            <h1 className="font-display text-2xl font-semibold text-text flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span>Room code:</span>
+              <span className="font-mono tracking-widest text-xl text-violet-light bg-violet-500/15 border border-violet-500/30 rounded-lg px-3 py-0.5">
+                {roomCode}
+              </span>
+              <button
+                type="button"
+                onClick={copyCode}
+                className="text-xs font-sans font-normal text-muted hover:text-text"
+              >
+                {copied === 'code' ? '✓ Copied' : 'Copy'}
+              </button>
             </h1>
             <p className="text-sm text-muted">
               {room?.movie_title || 'Watch together'} · {isHost ? 'You are host' : `Host: ${room?.host_name}`}
@@ -570,6 +733,13 @@ export default function WatchRoomPage() {
             >
               👥 Members ({participants.length})
             </button>
+            <button
+              type="button"
+              onClick={() => setShowInvite((v) => !v)}
+              className={`text-sm hover:text-text ${showInvite ? 'text-violet-light' : 'text-muted'}`}
+            >
+              🔗 Share
+            </button>
             <button onClick={handleLeave} className="text-sm text-muted hover:text-text">
               Leave
             </button>
@@ -583,6 +753,50 @@ export default function WatchRoomPage() {
             )}
           </div>
         </div>
+
+        {showInvite && (
+          <div className="glass rounded-xl p-4 mb-4">
+            <div className="flex items-start justify-between gap-3">
+              <p className="text-xs mono-label text-muted">Invite friends</p>
+              <button
+                type="button"
+                onClick={() => setShowInvite(false)}
+                className="text-xs text-muted hover:text-text"
+              >
+                ✕
+              </button>
+            </div>
+            <p className="text-sm text-text mt-2">
+              Room code:{' '}
+              <span className="font-mono tracking-widest text-violet-light">{roomCode}</span>
+            </p>
+            <div className="mt-2 flex flex-col sm:flex-row gap-2">
+              <input
+                readOnly
+                value={shareLink}
+                onFocus={(e) => e.currentTarget.select()}
+                className="flex-1 min-w-0 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-text"
+              />
+              <button type="button" onClick={copyLink} className="btn-primary text-sm">
+                {copied === 'link' ? '✓ Copied' : 'Copy link'}
+              </button>
+              <button type="button" onClick={shareInvite} className="btn-secondary text-sm">
+                Share
+              </button>
+              <a
+                href={`https://wa.me/?text=${encodeURIComponent(inviteText)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-secondary text-sm text-center"
+              >
+                WhatsApp
+              </a>
+            </div>
+            <p className="text-xs text-subtle mt-2">
+              Friends open the link, sign in and enter the room password. Share the password separately.
+            </p>
+          </div>
+        )}
 
         <div className="glass rounded-xl p-3 mb-4 text-sm">
           <div className="flex items-center justify-between">
@@ -634,11 +848,8 @@ export default function WatchRoomPage() {
         )}
 
         <div
-          className={`mb-6 grid gap-4 ${chatOpen ? 'lg:grid-cols-[minmax(0,1fr)_360px]' : ''}`}
-        >
-        <div
           ref={playerWrapRef}
-          className="aspect-video bg-black/40 rounded-2xl overflow-hidden relative"
+          className="aspect-video bg-black/40 rounded-2xl overflow-hidden mb-6 relative"
         >
           {youtubeId ? (
             <YouTubePlayer
@@ -650,6 +861,7 @@ export default function WatchRoomPage() {
             />
           ) : !isHost && remoteStream ? (
             <div ref={remoteShellRef} className="relative w-full h-full bg-black">
+              {chatOverlay}
               <video
                 ref={remoteVideoRef}
                 className="w-full h-full object-contain bg-black"
@@ -715,6 +927,7 @@ export default function WatchRoomPage() {
               externalTime={isHost ? undefined : externalTime}
               externalPlaying={isHost ? undefined : externalPlaying}
               onPlayState={onPlayState}
+              overlay={chatOverlay}
               className="w-full h-full"
             />
           ) : (
@@ -724,146 +937,8 @@ export default function WatchRoomPage() {
                 : 'Waiting for host to share a video...'}
             </div>
           )}
+          {overlayInWrapper && chatOverlay}
         </div>
-
-        {chatOpen && (
-          <div className="relative h-[480px] lg:h-auto">
-            <div className="absolute inset-0 flex flex-col rounded-2xl overflow-hidden border border-white/10 bg-obsidian">
-              <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
-                <h2 className="text-sm font-semibold text-text">Live chat</h2>
-                <button
-                  type="button"
-                  onClick={() => setChatOpen(false)}
-                  className="text-xs text-muted hover:text-text"
-                >
-                  Hide chat
-                </button>
-              </div>
-
-              <div
-                ref={scrollRef}
-                onScroll={handleChatScroll}
-                className="flex-1 min-h-0 overflow-y-auto px-3 py-2 space-y-1"
-              >
-                {messages.length === 0 && (
-                  <p className="text-xs text-muted text-center mt-6">
-                    Welcome to the live chat! Say hi 👋
-                  </p>
-                )}
-                {messages.map((m) => {
-                  if (m.type === 'system') {
-                    return (
-                      <p key={m.id} className="text-xs text-subtle text-center py-1">
-                        {m.text}
-                      </p>
-                    );
-                  }
-                  const fromHost = !!room?.host_id && m.participant_id === room.host_id;
-                  const mine = m.participant_id === userId;
-                  return (
-                    <div
-                      key={m.id}
-                      title={formatTime(m.created_at)}
-                      className="flex items-start gap-2 py-1 text-sm leading-snug"
-                    >
-                      <span
-                        className="w-6 h-6 shrink-0 rounded-full flex items-center justify-center text-[11px] font-semibold text-white"
-                        style={{ backgroundColor: avatarColor(m.participant_name) }}
-                      >
-                        {m.participant_name.charAt(0).toUpperCase()}
-                      </span>
-                      <p className="min-w-0 break-words">
-                        <span
-                          className={`font-semibold mr-2 ${
-                            fromHost ? 'text-violet-light' : mine ? 'text-text' : 'text-muted'
-                          }`}
-                        >
-                          {m.participant_name}
-                          {fromHost && (
-                            <span className="ml-1 text-[10px] bg-violet-500/30 text-violet-light rounded px-1 py-px align-middle">
-                              Host
-                            </span>
-                          )}
-                        </span>
-                        <span className="text-text">{m.text}</span>
-                      </p>
-                    </div>
-                  );
-                })}
-              </div>
-
-              {showJump && (
-                <button
-                  type="button"
-                  onClick={jumpToLatest}
-                  className="absolute bottom-28 left-1/2 -translate-x-1/2 text-xs bg-violet-500 text-white rounded-full px-3 py-1 shadow-lg"
-                >
-                  ↓ New messages
-                </button>
-              )}
-
-              {chatError && <p className="px-3 pb-1 text-xs text-red-400">{chatError}</p>}
-
-              <div className="border-t border-white/10 p-3">
-                <div className="flex items-center gap-2 mb-2 text-xs text-muted">
-                  <span
-                    className="w-5 h-5 shrink-0 rounded-full flex items-center justify-center text-[10px] font-semibold text-white"
-                    style={{ backgroundColor: avatarColor(myName) }}
-                  >
-                    {myName.charAt(0).toUpperCase()}
-                  </span>
-                  <span className="truncate">{myName}</span>
-                </div>
-                <div className="flex items-center gap-2 bg-white/5 border border-white/10 rounded-full pl-4 pr-1 py-1">
-                  <input
-                    type="text"
-                    value={chatInput}
-                    maxLength={1000}
-                    onChange={(e) => setChatInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault();
-                        void handleSendChat();
-                      }
-                    }}
-                    placeholder="Chat..."
-                    className="flex-1 min-w-0 bg-transparent outline-none text-sm text-text placeholder:text-subtle"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => void handleSendChat()}
-                    disabled={sending || !chatInput.trim()}
-                    aria-label="Send message"
-                    className="w-8 h-8 shrink-0 rounded-full bg-violet-500 text-white text-sm flex items-center justify-center disabled:opacity-40"
-                  >
-                    ➤
-                  </button>
-                </div>
-                {chatInput.length > 0 && (
-                  <div className="text-right text-[10px] text-subtle mt-1">{chatInput.length}/1000</div>
-                )}
-              </div>
-            </div>
-          </div>
-        )}
-        </div>
-
-        {!chatOpen && (
-          <div className="mb-6 -mt-3">
-            <button
-              type="button"
-              onClick={() => setChatOpen(true)}
-              className="text-sm text-muted hover:text-text"
-            >
-              💬 Show chat
-              {unread > 0 && (
-                <span className="ml-2 inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-full bg-violet-500 text-white text-[11px]">
-                  {unread}
-                </span>
-              )}
-            </button>
-          </div>
-        )}
 
         {!youtubeId && room?.video_src_type === 'local' && (
           <div className="text-xs text-subtle space-y-1">
