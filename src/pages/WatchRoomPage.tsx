@@ -1,226 +1,62 @@
-import { getRoom, setVideoSource, syncPlayback, deleteRoom, type Room } from '../services/rooms';
-import { useAuth } from '../contexts/AuthContext';
-import { getRoom, setVideoSource, syncPlayback, type Room } from '../services/rooms';
-import VideoPlayer from '../components/VideoPlayer';
-import YouTubePlayer from '../components/YouTubePlayer';
-import { createP2PHost, createP2PViewer } from '../lib/p2pMedia';
-import { extractYouTubeId } from '../utils/youtube';
-import { USE_LOCAL } from '../lib/mode';
-import { supabase } from '../lib/supabase';
-import { subscribeLocal } from '../lib/localStore';
 
-export default function WatchRoomPage() {
-  const { roomId } = useParams<{ roomId: string }>();
-  const navigate = useNavigate();
-  const { user } = useAuth();
+User attachment
 
-  const [room, setRoom] = useState<Room | null>(null);
-  const [isHost, setIsHost] = useState(false);
-  const [status, setStatus] = useState('Loading room...');
-  const [error, setError] = useState<string | null>(null);
-  const [localFileName, setLocalFileName] = useState<string | null>(null);
-  const [playUrl, setPlayUrl] = useState<string | null>(null);
-  const [youtubeId, setYoutubeId] = useState<string | null>(null);
-  const [bufferProgress, setBufferProgress] = useState<{ received: number; total: number } | null>(null);
-  const [viewerCount, setViewerCount] = useState(0);
-  const [externalTime, setExternalTime] = useState<number | undefined>();
-  const [externalPlaying, setExternalPlaying] = useState<boolean | undefined>();
+CinemaClub-main (1).zip
+File
+this error this is file.
+Maine screenshot aur tumhari uploaded CinemaClub project ZIP ko check kiya. GitHub Actions mein build fail hone ka main reason src/pages/WatchRoomPage.tsx file mein duplicate imports, missing React Router hooks aur galat JSX structure hai.
 
-  const hostRef = useRef<ReturnType<typeof createP2PHost> | null>(null);
-  const viewerRef = useRef<ReturnType<typeof createP2PViewer> | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const youtubeInputRef = useRef<HTMLInputElement>(null);
+1. Screenshot mein dikh rahe errors
+Error	Reason	Fix
+Cannot find name 'useNavigate'	Hook import nahi hua	useNavigate import karna
+Cannot find name 'useParams'	Hook import nahi hua	useParams import karna
+Duplicate identifier 'Room'	Room type multiple times import hua	Duplicate imports hatana
+Duplicate identifier 'syncPlayback'	Same function multiple times import hui	Ek hi import rakhna
+Duplicate identifier 'setVideoSource'	Same function multiple times import hui	Duplicate declaration hatana
+Duplicate identifier 'getRoom'	Same function multiple times import hui	Duplicate declaration hatana
+Ek aur problem: file ke JSX mein Leave button aur room-delete button galti se video-buffer progress bar ke andar chale gaye hain. Isse JSX structure bhi kharab ho sakta hai.
 
-  // Load room
-  useEffect(() => {
-    if (!roomId || !user) return;
-    let cancelled = false;
+2. Maine code mein kya fix kiya hai?
+WatchRoomPage.tsx mein maine ye changes kiye hain:
 
-    (async () => {
-      const r = await getRoom(roomId);
-      if (cancelled) return;
-      if (!r) {
-        setError('Room not found');
-        return;
-      }
-      setRoom(r);
-      setIsHost(r.host_id === user.id);
-      setLocalFileName(r.local_file_name);
-      setExternalTime(r.current_time);
-      setExternalPlaying(r.is_playing);
+React ke required hooks aur react-router-dom ke hooks import kiye.
+Duplicate imports remove kiye.
+Video buffering progress bar ka JSX structure theek kiya.
+Leave aur Delete Room buttons ko header mein rakha.
+Room delete karne ke baad home page par navigate karne ka existing behaviour preserve kiya.
+Local video P2P sharing, YouTube playback, playback synchronization aur room loading ka existing code preserve kiya.
+Mainne build command bhi chalaya. Lekin dependency installation timeout hone ke baad TypeScript ko kuch missing type-definition packages mile. Isliye abhi main poore project ka successful build confirm nahi kar sakta. Iska matlab ye nahi hai ki corrected file mein wahi errors abhi bhi hain; baaki build errors ki jaanch bhi zaroori hai.
 
-      if (r.video_src_type === 'youtube' && r.video_src) {
-        setYoutubeId(extractYouTubeId(r.video_src) || r.video_src);
-        setStatus('YouTube ready');
-      } else if (r.video_src_type === 'stream' && r.video_src) {
-        setPlayUrl(r.video_src);
-        setStatus('Stream ready');
-      } else {
-        setStatus(r.host_id === user.id ? 'Select a local video file to share' : 'Waiting for host to share a file...');
-      }
-    })();
+3. Download theek ki hui files
+Option A — Sirf corrected file
 
-    return () => {
-      cancelled = true;
-    };
-  }, [roomId, user]);
+Option B — Corrected CinemaClub project
 
-  // Realtime playback sync
-  useEffect(() => {
-    if (!roomId || !user) return;
+📦 Download CinemaClub-fixed.zip
 
-    if (USE_LOCAL) {
-      const unsub = subscribeLocal((payload: any) => {
-        if (payload?.type === 'playback' && payload?.roomId?.toUpperCase() === roomId.toUpperCase()) {
-          setExternalTime(payload.current_time);
-          setExternalPlaying(payload.is_playing);
-        }
-      });
-      return unsub;
-    }
+4. GitHub par fix kaise upload karna hai?
+Agar tum sirf ek file update karna chahte ho:
 
-    const channel = supabase.channel(`room-sync:${roomId.toUpperCase()}`);
-    channel
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'rooms',
-          filter: `id=eq.${roomId.toUpperCase()}`,
-        },
-        (payload) => {
-          const r = payload.new as Room;
-          setExternalTime(r.current_time);
-          setExternalPlaying(r.is_playing);
-        }
-      )
-      .subscribe();
+GitHub par apna CinemaClub repository kholo.
+src/pages/WatchRoomPage.tsx file kholo.
+Pencil ✏️ button par click karo.
+Purana code hatao aur downloaded WatchRoomPage.tsx ka poora code paste karo.
+Commit changes par click karo.
+GitHub Actions mein naya build run hone do.
+Agar tum ZIP use karna chahte ho, to pehle usse extract karo aur uske project files apne existing repository ke saath merge karo. Apni .env file aur local configuration ka backup rakhna.
 
-    return () => {
-      void supabase.removeChannel(channel);
-    };
-  }, [roomId, user]);
+5. Build dobara fail ho to?
+GitHub Actions mein naya run kholo. Agar build fail hota hai, to uske Annotations aur error logs ka screenshot bhej dena.
 
-  // Cleanup P2P
-  useEffect(() => {
-    return () => {
-      hostRef.current?.stop();
-      viewerRef.current?.stop();
-    };
-  }, []);
+Important: Maine file ke duplicate imports aur JSX structure ko fix kiya hai, lekin poore project ka successful build aur actual video sharing abhi verify nahi hua hai. Humein next build ke errors bhi check karne honge, taaki CinemaClub ko sahi tarah chalaya ja sake.
 
-  const startHostP2P = useCallback(
-    async (file: File) => {
-      if (!roomId || !user || !isHost) return;
-      hostRef.current?.stop();
-      setError(null);
-      setStatus('Starting P2P share...');
-      setLocalFileName(file.name);
-      setPlayUrl(URL.createObjectURL(file));
 
-      const host = createP2PHost({
-        roomId,
-        hostId: user.id,
-        file,
-        onViewerCount: setViewerCount,
-        onProgress: (_id, sent, total) => {
-          setBufferProgress({ received: sent, total });
-        },
-      });
-      hostRef.current = host;
-      await host.start();
-      setStatus(`Sharing "${file.name}"`);
+WatchRoomPage.tsx
+Code
+You’re out of attachments for now. Upgrade your plan for more, or try again tomorrow after 11:46 AM.
 
-      await setVideoSource(roomId, user.id, 'local', undefined, file.name);
-      setRoom((prev) =>
-        prev ? { ...prev, video_src_type: 'local', local_file_name: file.name } : prev
-      );
-    },
-    [roomId, user, isHost]
-  );
 
-  const startViewerP2P = useCallback(async () => {
-    if (!roomId || !user || isHost || !room?.host_id) return;
-    viewerRef.current?.stop();
-    setError(null);
-    setStatus('Requesting video from host...');
 
-    const viewer = createP2PViewer({
-      roomId,
-      viewerId: user.id,
-      hostId: room.host_id,
-      onPlayableUrl: (url, info) => {
-        setPlayUrl(url);
-        if (info?.complete) setStatus(`Playing "${info.fileName}" (complete)`);
-        else if (url) setStatus(`Playing "${info?.fileName || 'video'}" (buffering...)`);
-        else setStatus('Host stopped sharing');
-      },
-      onStatus: (s) => {
-        if (s === 'connected') setStatus('P2P connected — receiving video...');
-        else if (s === 'failed') setStatus('Connection failed — check network');
-        else if (s === 'requesting') setStatus('Waiting for host...');
-      },
-      onBufferProgress: (received, total) => setBufferProgress({ received, total }),
-    });
-    viewerRef.current = viewer;
-    await viewer.start();
-  }, [roomId, user, isHost, room?.host_id]);
-
-  useEffect(() => {
-    if (isHost || !room || room.video_src_type !== 'local' || !room.host_id) return;
-    void startViewerP2P();
-  }, [isHost, room, startViewerP2P]);
-
-  const handleLocalFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    await startHostP2P(file);
-  };
-
-  const handleYouTubeSubmit = async () => {
-    if (!isHost || !roomId || !user || !youtubeInputRef.current) return;
-    const raw = youtubeInputRef.current.value.trim();
-    const id = extractYouTubeId(raw);
-    if (!id) {
-      setError('Invalid YouTube URL or ID');
-      return;
-    }
-    setError(null);
-    setYoutubeId(id);
-    setPlayUrl(null);
-    setStatus('YouTube loaded');
-    await setVideoSource(roomId, user.id, 'youtube', id);
-    setRoom((prev) => (prev ? { ...prev, video_src_type: 'youtube', video_src: id } : prev));
-  };
-
-  const onPlayState = useCallback(
-    (playing: boolean, time: number) => {
-      if (!isHost || !roomId || !user) return;
-      void syncPlayback(roomId, user.id, playing, time);
-    },
-    [isHost, roomId, user]
-  );
-
-  if (!user) {
-    return (
-      <div className="min-h-screen bg-obsidian pt-24 flex items-center justify-center text-muted">
-        Please sign in to join a room.
-      </div>
-    );
-  }
-
-  if (error && !room) {
-    return (
-      <div className="min-h-screen bg-obsidian pt-24 flex items-center justify-center text-red-400">
-        {error}
-      </div>
-    );
-  }
-
-  return (
-    <div className="min-h-screen bg-obsidian pt-20 pb-12 px-4">
-      <div className="max-w-5xl mx-auto">
         <div className="flex items-center justify-between mb-4">
           <div>
             <h1 className="font-display text-2xl font-semibold text-text">
@@ -230,9 +66,28 @@ export default function WatchRoomPage() {
               {room?.movie_title || 'Watch together'} · {isHost ? 'You are host' : `Host: ${room?.host_name}`}
             </p>
           </div>
-          <button onClick={() => navigate('/')} className="text-sm text-muted hover:text-text">
-            Leave
-          </button>
+          <div className="flex items-center gap-3">
+            {isHost && (
+              <button
+                onClick={async () => {
+                  if (!roomId || !user) return;
+                  if (!confirm('Delete this room?')) return;
+                  const result = await deleteRoom(roomId, user.id);
+                  if (result.error) {
+                    alert(result.error);
+                    return;
+                  }
+                  navigate('/');
+                }}
+                className="text-sm text-red-400 hover:text-red-300"
+              >
+                Delete Room
+              </button>
+            )}
+            <button onClick={() => navigate('/')} className="text-sm text-muted hover:text-text">
+              Leave
+            </button>
+          </div>
         </div>
 
         <div className="glass rounded-xl p-3 mb-4 text-sm">
@@ -244,27 +99,6 @@ export default function WatchRoomPage() {
           </div>
           {bufferProgress && bufferProgress.total > 0 && (
             <div className="mt-2 h-1.5 bg-white/10 rounded-full overflow-hidden">
-            <button onClick={() => navigate('/')} className="text-sm text-muted hover:text-text">
-                 Leave
-            </button>
-
-            {isHost && (
-              <button
-                onClick={async () => {
-                  if (!roomId || !user) return;
-                  if (!confirm('Delete this room?')) return;
-                  const { error } = await deleteRoom(roomId, user.id);
-                  if (error) {
-                    alert(error);
-                    return;
-                  }
-                  navigate('/');
-                }}
-                className="text-sm text-red-400 hover:text-red-300 ml-3"
-              >
-                Delete Room
-              </button>
-            )}     
               <div
                 className="h-full bg-violet-500 transition-all"
                 style={{
@@ -351,5 +185,3 @@ export default function WatchRoomPage() {
         )}
       </div>
     </div>
-  );
-}
