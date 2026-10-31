@@ -4,7 +4,8 @@ import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
 
 export default defineConfig({
-  base: '/CinemaClub/',
+  // Vercel build mein VERCEL env var apne aap set hota hai
+  base: process.env.VERCEL ? '/' : '/CinemaClub/',
   build: { sourcemap: false },
   plugins: [react(), tailwindcss()],
   resolve: {
