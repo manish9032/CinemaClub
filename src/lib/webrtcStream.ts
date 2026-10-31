@@ -1,19 +1,78 @@
 // src/lib/webrtcStream.ts
+//
+// Live P2P video streaming for the watch-party room.
+//   HOST   : captures its own <video> element (captureStream) and sends the live
+//            MediaStream to every viewer over WebRTC (one RTCPeerConnection per viewer).
+//   VIEWER : receives the live MediaStream and hands the WHOLE stream to
+//            `onRemoteStream`, so the page can bind it to `video.srcObject`.
+//
+// Whatever the host does (play / pause / seek) is mirrored automatically because
+// viewers are watching the host's live output, not a downloaded file.
+
+import { USE_LOCAL } from './mode';
+import { supabase } from './supabase';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
 export type StreamRole = 'host' | 'viewer';
 
 export interface StreamCallbacks {
+  /** Viewer: fired with the complete live MediaStream (tracks already enabled). */
   onRemoteStream?: (stream: MediaStream) => void;
+  /** Viewer: host left / stopped sharing. */
+  onRemoteStreamEnded?: () => void;
+  /** Host: number of viewers currently negotiated. */
+  onViewerCount?: (count: number) => void;
   onConnectionState?: (state: RTCPeerConnectionState) => void;
   onIceConnectionState?: (state: RTCIceConnectionState) => void;
   onError?: (err: Error) => void;
   onStatus?: (status: string) => void;
 }
 
-/** Signaling adapter – Socket.io ya Supabase dono ke saath chalega */
-export interface SignalingAdapter {
-  send: (event: string, payload: any) => void;
-  on: (event: string, handler: (payload: any) => void) => () => void;
+/** Every signaling message has this shape. */
+export interface SignalMessage {
+  from: string;
+  to?: string;
+  role?: StreamRole;
+  sdp?: RTCSessionDescriptionInit;
+  candidate?: RTCIceCandidateInit;
 }
+
+export type SignalHandler = (payload: SignalMessage) => void;
+
+/** Signaling adapter – Supabase broadcast (or BroadcastChannel in local mode). */
+export interface SignalingAdapter {
+  send: (event: string, payload: SignalMessage) => void;
+  on: (event: string, handler: SignalHandler) => () => void;
+  /** Open the underlying channel (resolves once messages can flow). */
+  connect?: () => Promise<void>;
+  /** Close the underlying channel. */
+  close?: () => void;
+}
+
+export interface HostStartOptions {
+  /**
+   * Try to call video.play() before capturing (falls back to a muted play).
+   * Default false: the host presses play himself and viewers follow.
+   */
+  autoPlay?: boolean;
+}
+
+interface CaptureCapable {
+  captureStream?: (frameRate?: number) => MediaStream;
+  mozCaptureStream?: (frameRate?: number) => MediaStream;
+}
+
+interface HostPeer {
+  pc: RTCPeerConnection;
+  pendingIce: RTCIceCandidateInit[];
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -30,68 +89,213 @@ const ICE_SERVERS: RTCIceServer[] = [
   },
 ];
 
-// Fix TypeScript types for captureStream
-interface CaptureVideoElement extends HTMLVideoElement {
-  captureStream(frameRate?: number): MediaStream;
-  mozCaptureStream?(frameRate?: number): MediaStream;
-}
+const CAPTURE_FPS = 30;
+const CAPTURE_SETTLE_MS = 100; // let the browser initialise the captured tracks
+const MAX_VIDEO_BITRATE = 4_000_000; // 4 Mbps
+const VIEWER_RETRY_MS = 5000;
 
-/** Wait until video has real frames + audio ready */
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const delay = (ms: number): Promise<void> =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/** Wait until the element has metadata + real dimensions. */
 function waitForVideoReady(video: HTMLVideoElement, timeoutMs = 15000): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (video.readyState >= 3 && video.videoWidth > 0) {
+  const isReady = (): boolean =>
+    video.videoWidth > 0 && video.readyState >= HTMLMediaElement.HAVE_METADATA;
+
+  return new Promise<void>((resolve, reject) => {
+    if (isReady()) {
       resolve();
       return;
     }
 
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error('Video metadata / frames load timeout. File codec browser support nahi karta (MKV/H.265?).'));
-    }, timeoutMs);
+    const events = ['loadedmetadata', 'loadeddata', 'canplay', 'playing'] as const;
 
-    const onReady = () => {
-      if (video.videoWidth > 0 && video.readyState >= 2) {
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      events.forEach((ev) => video.removeEventListener(ev, onReady));
+      video.removeEventListener('error', onError);
+    };
+
+    const onReady = (): void => {
+      if (isReady()) {
         cleanup();
         resolve();
       }
     };
 
-    const cleanup = () => {
-      clearTimeout(timer);
-      video.removeEventListener('loadedmetadata', onReady);
-      video.removeEventListener('loadeddata', onReady);
-      video.removeEventListener('canplay', onReady);
-      video.removeEventListener('playing', onReady);
-      video.removeEventListener('error', onError);
-    };
-
-    const onError = () => {
+    const onError = (): void => {
       cleanup();
-      reject(new Error(video.error?.message || 'Video load error'));
+      reject(new Error(video.error?.message || 'Video failed to load'));
     };
 
-    video.addEventListener('loadedmetadata', onReady);
-    video.addEventListener('loadeddata', onReady);
-    video.addEventListener('canplay', onReady);
-    video.addEventListener('playing', onReady);
-    video.addEventListener('error', onError);
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(
+        new Error(
+          'Video metadata did not load in time. The file codec may not be supported by this browser (MKV / H.265?). Try an H.264 MP4.'
+        )
+      );
+    }, timeoutMs);
 
-    onReady();
+    events.forEach((ev) => video.addEventListener(ev, onReady));
+    video.addEventListener('error', onError);
   });
 }
 
+/** play() with a muted fallback (host side, only used when autoPlay is requested). */
+async function safePlay(video: HTMLVideoElement): Promise<void> {
+  try {
+    await video.play();
+  } catch {
+    const wasMuted = video.muted;
+    video.muted = true;
+    try {
+      await video.play();
+    } finally {
+      video.muted = wasMuted;
+    }
+  }
+}
+
+/** Capture the element's output as a live MediaStream with all tracks enabled. */
+function captureFromVideo(video: HTMLVideoElement): MediaStream {
+  const el = video as unknown as CaptureCapable;
+  const capture = el.captureStream ?? el.mozCaptureStream;
+  if (typeof capture !== 'function') {
+    throw new Error('captureStream() is not supported in this browser. Use Chrome, Edge or Firefox.');
+  }
+
+  const stream = capture.call(video, CAPTURE_FPS);
+  stream.getTracks().forEach((track) => {
+    track.enabled = true;
+  });
+
+  if (stream.getVideoTracks().length === 0) {
+    stream.getTracks().forEach((track) => track.stop());
+    throw new Error('No video track could be captured. The file codec is probably unsupported (try H.264 MP4).');
+  }
+  return stream;
+}
+
+// ---------------------------------------------------------------------------
+// Room signaling (Supabase broadcast, or BroadcastChannel when USE_LOCAL)
+// ---------------------------------------------------------------------------
+
+export function createRoomSignaling(roomId: string, userId: string): SignalingAdapter {
+  const channelName = `cc-live:${roomId.toUpperCase()}`;
+  const handlers = new Map<string, Set<SignalHandler>>();
+  let bc: BroadcastChannel | null = null;
+  let sb: ReturnType<typeof supabase.channel> | null = null;
+  let ready = false;
+
+  const dispatch = (event: string, payload: SignalMessage | undefined): void => {
+    if (!payload || payload.from === userId) return;
+    handlers.get(event)?.forEach((handler) => {
+      try {
+        handler(payload);
+      } catch (e) {
+        console.error('[signaling] handler error', event, e);
+      }
+    });
+  };
+
+  return {
+    send(event, payload) {
+      if (USE_LOCAL) {
+        bc?.postMessage({ event, payload });
+        return;
+      }
+      if (sb && ready) {
+        void sb.send({ type: 'broadcast', event: 'live', payload: { event, data: payload } });
+      }
+    },
+
+    on(event, handler) {
+      let set = handlers.get(event);
+      if (!set) {
+        set = new Set<SignalHandler>();
+        handlers.set(event, set);
+      }
+      set.add(handler);
+      return () => {
+        set?.delete(handler);
+      };
+    },
+
+    async connect() {
+      if (USE_LOCAL) {
+        if (typeof BroadcastChannel === 'undefined') return;
+        bc = new BroadcastChannel(channelName);
+        bc.onmessage = (e: MessageEvent) => {
+          const msg = e.data as { event?: string; payload?: SignalMessage } | null;
+          if (msg && typeof msg.event === 'string') dispatch(msg.event, msg.payload);
+        };
+        ready = true;
+        return;
+      }
+
+      const channel = supabase.channel(channelName, { config: { broadcast: { self: false } } });
+      sb = channel;
+      channel.on('broadcast', { event: 'live' }, ({ payload }) => {
+        const msg = payload as { event?: string; data?: SignalMessage } | null;
+        if (msg && typeof msg.event === 'string') dispatch(msg.event, msg.data);
+      });
+
+      await new Promise<void>((resolve) => {
+        channel.subscribe((status) => {
+          if (status === 'SUBSCRIBED') {
+            ready = true;
+            resolve();
+          } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+            console.error('[signaling] channel status', status);
+            resolve();
+          }
+        });
+      });
+    },
+
+    close() {
+      handlers.clear();
+      bc?.close();
+      bc = null;
+      if (sb) {
+        void supabase.removeChannel(sb);
+        sb = null;
+      }
+      ready = false;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// WebRTCStream
+// ---------------------------------------------------------------------------
+
 export class WebRTCStream {
-  private pc: RTCPeerConnection | null = null;
-  private localStream: MediaStream | null = null;
-  private senders: RTCRtpSender[] = [];
-  private role: StreamRole;
-  private userId: string;
-  private callbacks: StreamCallbacks;
-  private signaling: SignalingAdapter;
+  private readonly role: StreamRole;
+  private readonly userId: string;
+  private readonly signaling: SignalingAdapter;
+  private readonly callbacks: StreamCallbacks;
+
   private unsubscribers: Array<() => void> = [];
-  private makingOffer = false;
-  private ignoreOffer = false;
-  private isSettingRemoteAnswerPending = false;
+  private stopped = false;
+
+  // host state
+  private localStream: MediaStream | null = null;
+  private readonly peers = new Map<string, HostPeer>();
+  private readonly connecting = new Set<string>();
+
+  // viewer state
+  private pc: RTCPeerConnection | null = null;
+  private pendingIce: RTCIceCandidateInit[] = [];
+  private remoteStream: MediaStream | null = null;
+  private retryTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     role: StreamRole,
@@ -105,270 +309,429 @@ export class WebRTCStream {
     this.callbacks = callbacks;
   }
 
-  // -------------------- HOST --------------------
-  async startAsHost(videoElement: HTMLVideoElement) {
-    if (this.role !== 'host') throw new Error('Only host');
+  // ======================================================================
+  // HOST
+  // ======================================================================
 
+  /** Start sharing `videoElement`. Safe to call once; use replaceSource() afterwards. */
+  async startAsHost(videoElement: HTMLVideoElement, options: HostStartOptions = {}): Promise<void> {
+    this.assertRole('host');
+    this.stopped = false;
     this.callbacks.onStatus?.('preparing-video');
 
+    // Listen first so no viewer request is missed while we prepare the video.
+    this.wireHostSignaling();
+    await this.signaling.connect?.();
+
     try {
-      if (videoElement.paused) {
-        await videoElement.play();
-      }
+      await this.attachSource(videoElement, options);
     } catch (e) {
-      videoElement.muted = true;
-      await videoElement.play();
-      videoElement.muted = false;
+      const err = e instanceof Error ? e : new Error(errMsg(e));
+      this.callbacks.onError?.(err);
+      throw err;
     }
-
-    await waitForVideoReady(videoElement);
-
-    const captureEl = videoElement as CaptureVideoElement;
-    const stream = captureEl.captureStream
-      ? captureEl.captureStream()
-      : captureEl.mozCaptureStream?.();
-
-    if (!stream) {
-      throw new Error('captureStream not supported in this browser');
-    }
-
-    this.localStream = stream;
-
-    stream.getTracks().forEach((track: MediaStreamTrack) => {
-      track.enabled = true;
-      if ('muted' in track && (track as any).muted) {
-        console.warn('Track was muted, forcing enabled', track.kind);
-      }
-    });
-
-    const videoTracks = stream.getVideoTracks();
-    const audioTracks = stream.getAudioTracks();
-
-    if (videoTracks.length === 0) {
-      throw new Error(
-        'No video track from captureStream. File codec unsupported (try H.264 MP4).'
-      );
-    }
-
-    console.log('[Host] tracks', {
-      video: videoTracks.map((t: MediaStreamTrack) => ({
-        id: t.id,
-        readyState: t.readyState,
-        enabled: t.enabled,
-        muted: (t as any).muted,
-        settings: t.getSettings?.(),
-      })),
-      audio: audioTracks.map((t: MediaStreamTrack) => ({
-        id: t.id,
-        readyState: t.readyState,
-        enabled: t.enabled,
-      })),
-    });
-
-    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-
-    this.senders = [];
-    stream.getTracks().forEach((track: MediaStreamTrack) => {
-      const sender = this.pc!.addTrack(track, stream);
-      this.senders.push(sender);
-    });
-
-    this.wirePeerConnection();
-    this.wireSignaling();
-
-    await this.createAndSendOffer();
     this.callbacks.onStatus?.('streaming');
   }
 
-  async replaceSource(videoElement: HTMLVideoElement) {
-    if (this.role !== 'host' || !this.pc) {
-      throw new Error('replaceSource only after startAsHost');
+  /**
+   * Host picked another file: capture the element again and make every viewer
+   * reconnect to the new stream.
+   */
+  async replaceSource(videoElement: HTMLVideoElement, options: HostStartOptions = {}): Promise<void> {
+    this.assertRole('host');
+    try {
+      await this.attachSource(videoElement, options);
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(errMsg(e));
+      this.callbacks.onError?.(err);
+      throw err;
     }
-
-    if (videoElement.paused) {
-      try {
-        await videoElement.play();
-      } catch {
-        videoElement.muted = true;
-        await videoElement.play();
-        videoElement.muted = false;
-      }
-    }
-
-    await waitForVideoReady(videoElement);
-
-    const newStream = (videoElement as CaptureVideoElement).captureStream();
-    newStream.getTracks().forEach((t: MediaStreamTrack) => (t.enabled = true));
-
-    const newVideo = newStream.getVideoTracks()[0] || null;
-    const newAudio = newStream.getAudioTracks()[0] || null;
-
-    for (const sender of this.senders) {
-      if (sender.track?.kind === 'video' && newVideo) {
-        await sender.replaceTrack(newVideo);
-      } else if (sender.track?.kind === 'audio' && newAudio) {
-        await sender.replaceTrack(newAudio);
-      }
-    }
-
-    if (newAudio && !this.senders.some((s) => s.track?.kind === 'audio')) {
-      const s = this.pc.addTrack(newAudio, newStream);
-      this.senders.push(s);
-      await this.createAndSendOffer();
-    }
-
-    this.localStream?.getTracks().forEach((t: MediaStreamTrack) => t.stop());
-    this.localStream = newStream;
-
     this.callbacks.onStatus?.('source-replaced');
   }
 
-  // -------------------- VIEWER --------------------
-  async startAsViewer() {
-    if (this.role !== 'viewer') throw new Error('Only viewer');
-
-    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    this.wirePeerConnection();
-    this.wireSignaling();
-    this.callbacks.onStatus?.('waiting-for-host');
-  }
-
-  // -------------------- Internal --------------------
-  private wirePeerConnection() {
-    if (!this.pc) return;
-
-    this.pc.onicecandidate = (ev) => {
-      if (ev.candidate) {
-        this.signaling.send('ice-candidate', {
-          candidate: ev.candidate.toJSON(),
-          from: this.userId,
-        });
-      }
-    };
-
-    this.pc.onconnectionstatechange = () => {
-      const s = this.pc!.connectionState;
-      this.callbacks.onConnectionState?.(s);
-      this.callbacks.onStatus?.(s);
-      if (s === 'failed') {
-        this.callbacks.onError?.(new Error('Peer connection failed'));
-      }
-    };
-
-    this.pc.oniceconnectionstatechange = () => {
-      this.callbacks.onIceConnectionState?.(this.pc!.iceConnectionState);
-    };
-
-    this.pc.ontrack = (ev) => {
-      const stream = ev.streams[0] || new MediaStream([ev.track]);
-      stream.getTracks().forEach((t: MediaStreamTrack) => (t.enabled = true));
-
-      console.log('[Viewer] ontrack', {
-        kind: ev.track.kind,
-        readyState: ev.track.readyState,
-        enabled: ev.track.enabled,
-        muted: (ev.track as any).muted,
-      });
-
-      this.callbacks.onRemoteStream?.(stream);
-      this.callbacks.onStatus?.('receiving');
-    };
-  }
-
-  private wireSignaling() {
-    this.unsubscribers.forEach((u) => u());
-    this.unsubscribers = [];
-
-    this.unsubscribers.push(
-      this.signaling.on('offer', async (data: any) => {
-        if (data.from === this.userId) return;
-        await this.handleOffer(data.sdp, data.from);
-      })
-    );
-
-    this.unsubscribers.push(
-      this.signaling.on('answer', async (data: any) => {
-        if (data.from === this.userId) return;
-        await this.handleAnswer(data.sdp);
-      })
-    );
-
-    this.unsubscribers.push(
-      this.signaling.on('ice-candidate', async (data: any) => {
-        if (data.from === this.userId) return;
-        await this.handleIceCandidate(data.candidate);
-      })
-    );
-  }
-
-  private async createAndSendOffer() {
-    if (!this.pc) return;
-    try {
-      this.makingOffer = true;
-      const offer = await this.pc.createOffer({
-        offerToReceiveAudio: false,
-        offerToReceiveVideo: false,
-      });
-      await this.pc.setLocalDescription(offer);
-      this.signaling.send('offer', {
-        sdp: this.pc.localDescription,
-        from: this.userId,
-      });
-    } finally {
-      this.makingOffer = false;
+  private async attachSource(video: HTMLVideoElement, options: HostStartOptions): Promise<void> {
+    if (options.autoPlay && video.paused) {
+      await safePlay(video);
     }
-  }
 
-  async handleOffer(offer: RTCSessionDescriptionInit, from?: string) {
-    if (!this.pc) return;
+    await waitForVideoReady(video);
+    // Race-condition guard: give the browser a moment to initialise the tracks.
+    await delay(CAPTURE_SETTLE_MS);
 
-    const readyForOffer =
-      !this.makingOffer &&
-      (this.pc.signalingState === 'stable' || this.isSettingRemoteAnswerPending);
+    let next: MediaStream | null = null;
+    for (let attempt = 0; attempt < 3 && !next; attempt++) {
+      try {
+        next = captureFromVideo(video);
+      } catch (e) {
+        if (attempt === 2) throw e;
+        await delay(150);
+      }
+    }
+    if (!next) throw new Error('Could not capture the video stream.');
 
-    const offerCollision = !readyForOffer;
-    this.ignoreOffer = this.role === 'host' && offerCollision;
-    if (this.ignoreOffer) return;
+    const previous = this.localStream;
+    this.localStream = next;
 
-    this.isSettingRemoteAnswerPending = true;
-    await this.pc.setRemoteDescription(offer);
-    this.isSettingRemoteAnswerPending = false;
+    this.closeAllPeers();
+    previous?.getTracks().forEach((track) => track.stop());
 
-    const answer = await this.pc.createAnswer();
-    await this.pc.setLocalDescription(answer);
-
-    this.signaling.send('answer', {
-      sdp: this.pc.localDescription,
+    // First source -> "host-ready". Later sources -> force viewers to reconnect.
+    this.signaling.send(previous ? 'source-changed' : 'host-ready', {
       from: this.userId,
-      to: from,
+      role: 'host',
     });
   }
 
-  async handleAnswer(answer: RTCSessionDescriptionInit) {
-    if (!this.pc) return;
-    if (this.pc.signalingState === 'have-local-offer') {
-      await this.pc.setRemoteDescription(answer);
-    }
+  private wireHostSignaling(): void {
+    this.clearSignaling();
+
+    this.unsubscribers.push(
+      this.signaling.on('need-stream', (m) => {
+        void this.createPeerForViewer(m.from);
+      }),
+      this.signaling.on('answer', (m) => {
+        void this.handleHostAnswer(m);
+      }),
+      this.signaling.on('ice-candidate', (m) => {
+        void this.handleHostIce(m);
+      }),
+      this.signaling.on('goodbye', (m) => {
+        if (m.role === 'viewer') this.closePeer(m.from);
+      })
+    );
   }
 
-  async handleIceCandidate(candidate: RTCIceCandidateInit) {
-    if (!this.pc) return;
+  private async createPeerForViewer(viewerId: string): Promise<void> {
+    const stream = this.localStream;
+    if (!stream || this.stopped || this.connecting.has(viewerId)) return;
+
+    this.connecting.add(viewerId);
     try {
-      await this.pc.addIceCandidate(candidate);
+      this.closePeer(viewerId);
+
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      this.peers.set(viewerId, { pc, pendingIce: [] });
+      this.callbacks.onViewerCount?.(this.peers.size);
+
+      stream.getTracks().forEach((track) => {
+        track.enabled = true;
+        pc.addTrack(track, stream);
+      });
+
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+          this.signaling.send('ice-candidate', {
+            from: this.userId,
+            to: viewerId,
+            role: 'host',
+            candidate: ev.candidate.toJSON(),
+          });
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (this.peers.get(viewerId)?.pc !== pc) return;
+        this.callbacks.onConnectionState?.(pc.connectionState);
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+          this.closePeer(viewerId);
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        if (this.peers.get(viewerId)?.pc === pc) {
+          this.callbacks.onIceConnectionState?.(pc.iceConnectionState);
+        }
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      this.signaling.send('offer', {
+        from: this.userId,
+        to: viewerId,
+        role: 'host',
+        sdp: pc.localDescription?.toJSON() ?? offer,
+      });
+
+      this.tuneSenders(pc);
     } catch (e) {
-      if (!this.ignoreOffer) {
-        console.warn('addIceCandidate failed', e);
-      }
+      console.error('[host] failed to create peer', e);
+      this.callbacks.onError?.(e instanceof Error ? e : new Error(errMsg(e)));
+      this.closePeer(viewerId);
+    } finally {
+      this.connecting.delete(viewerId);
     }
   }
 
-  stop() {
-    this.unsubscribers.forEach((u) => u());
-    this.unsubscribers = [];
-    this.localStream?.getTracks().forEach((t: MediaStreamTrack) => t.stop());
-    this.pc?.close();
-    this.pc = null;
+  private async handleHostAnswer(m: SignalMessage): Promise<void> {
+    if (m.to !== this.userId || !m.sdp) return;
+    const entry = this.peers.get(m.from);
+    if (!entry || entry.pc.currentRemoteDescription) return;
+
+    try {
+      await entry.pc.setRemoteDescription(m.sdp);
+      const queued = entry.pendingIce.splice(0);
+      for (const candidate of queued) {
+        try {
+          await entry.pc.addIceCandidate(candidate);
+        } catch {
+          /* stale candidate */
+        }
+      }
+    } catch (e) {
+      console.error('[host] setRemoteDescription failed', e);
+    }
+  }
+
+  private async handleHostIce(m: SignalMessage): Promise<void> {
+    if (m.to !== this.userId || !m.candidate) return;
+    const entry = this.peers.get(m.from);
+    if (!entry) return;
+
+    if (entry.pc.remoteDescription) {
+      try {
+        await entry.pc.addIceCandidate(m.candidate);
+      } catch {
+        /* stale candidate */
+      }
+    } else {
+      entry.pendingIce.push(m.candidate);
+    }
+  }
+
+  /** Smooth framerate for movies + a sensible bitrate cap. */
+  private tuneSenders(pc: RTCPeerConnection): void {
+    pc.getSenders().forEach((sender) => {
+      const track = sender.track;
+      if (!track || track.kind !== 'video') return;
+
+      try {
+        (track as MediaStreamTrack & { contentHint?: string }).contentHint = 'motion';
+      } catch {
+        /* not supported */
+      }
+
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+      params.encodings[0].maxBitrate = MAX_VIDEO_BITRATE;
+      params.encodings[0].maxFramerate = CAPTURE_FPS;
+      sender.setParameters(params).catch(() => {
+        /* browser may reject – harmless */
+      });
+    });
+  }
+
+  private closePeer(viewerId: string): void {
+    const entry = this.peers.get(viewerId);
+    if (!entry) return;
+    entry.pc.onicecandidate = null;
+    entry.pc.onconnectionstatechange = null;
+    entry.pc.oniceconnectionstatechange = null;
+    entry.pc.close();
+    this.peers.delete(viewerId);
+    this.callbacks.onViewerCount?.(this.peers.size);
+  }
+
+  private closeAllPeers(): void {
+    Array.from(this.peers.keys()).forEach((id) => this.closePeer(id));
+  }
+
+  // ======================================================================
+  // VIEWER
+  // ======================================================================
+
+  async startAsViewer(): Promise<void> {
+    this.assertRole('viewer');
+    this.stopped = false;
+    this.callbacks.onStatus?.('waiting-for-host');
+
+    this.wireViewerSignaling();
+    await this.signaling.connect?.();
+
+    this.requestStream();
+    this.retryTimer = setInterval(() => {
+      if (this.stopped) return;
+      const state = this.pc?.connectionState;
+      if (!this.pc || state === 'failed' || state === 'closed') this.requestStream();
+    }, VIEWER_RETRY_MS);
+  }
+
+  private requestStream(): void {
+    if (this.stopped) return;
+    this.signaling.send('need-stream', { from: this.userId, role: 'viewer' });
+    this.callbacks.onStatus?.('requesting');
+  }
+
+  private wireViewerSignaling(): void {
+    this.clearSignaling();
+
+    this.unsubscribers.push(
+      this.signaling.on('offer', (m) => {
+        void this.handleViewerOffer(m);
+      }),
+      this.signaling.on('ice-candidate', (m) => {
+        void this.handleViewerIce(m);
+      }),
+      this.signaling.on('host-ready', () => {
+        const state = this.pc?.connectionState;
+        if (!this.pc || state === 'failed' || state === 'closed') this.requestStream();
+      }),
+      this.signaling.on('source-changed', () => {
+        this.requestStream();
+      }),
+      this.signaling.on('goodbye', (m) => {
+        if (m.role !== 'host') return;
+        this.closeViewerPc();
+        this.remoteStream = null;
+        this.callbacks.onStatus?.('host-left');
+        this.callbacks.onRemoteStreamEnded?.();
+      })
+    );
+  }
+
+  private async handleViewerOffer(m: SignalMessage): Promise<void> {
+    if (m.to !== this.userId || !m.sdp || this.stopped) return;
+
+    try {
+      this.closeViewerPc();
+      this.remoteStream = null;
+
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      this.pc = pc;
+
+      pc.ontrack = (ev: RTCTrackEvent) => {
+        if (this.pc !== pc) return;
+
+        const incoming = ev.streams[0];
+        if (incoming) {
+          this.remoteStream = incoming;
+        } else {
+          // Sender did not attach a stream id: build one ourselves.
+          if (!this.remoteStream) this.remoteStream = new MediaStream();
+          if (!this.remoteStream.getTracks().includes(ev.track)) {
+            this.remoteStream.addTrack(ev.track);
+          }
+        }
+
+        ev.track.enabled = true;
+        this.remoteStream.getTracks().forEach((track) => {
+          track.enabled = true;
+        });
+
+        this.callbacks.onRemoteStream?.(this.remoteStream);
+        this.callbacks.onStatus?.('receiving');
+      };
+
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+          this.signaling.send('ice-candidate', {
+            from: this.userId,
+            to: m.from,
+            role: 'viewer',
+            candidate: ev.candidate.toJSON(),
+          });
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (this.pc !== pc) return;
+        this.callbacks.onConnectionState?.(pc.connectionState);
+        if (pc.connectionState === 'failed') {
+          this.callbacks.onError?.(new Error('Peer connection failed'));
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        if (this.pc === pc) this.callbacks.onIceConnectionState?.(pc.iceConnectionState);
+      };
+
+      this.callbacks.onStatus?.('connecting');
+      await pc.setRemoteDescription(m.sdp);
+
+      const queued = this.pendingIce.splice(0);
+      for (const candidate of queued) {
+        try {
+          await pc.addIceCandidate(candidate);
+        } catch {
+          /* stale candidate */
+        }
+      }
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      this.signaling.send('answer', {
+        from: this.userId,
+        to: m.from,
+        role: 'viewer',
+        sdp: pc.localDescription?.toJSON() ?? answer,
+      });
+    } catch (e) {
+      console.error('[viewer] offer handling failed', e);
+      this.callbacks.onError?.(e instanceof Error ? e : new Error(errMsg(e)));
+    }
+  }
+
+  private async handleViewerIce(m: SignalMessage): Promise<void> {
+    if (m.to !== this.userId || !m.candidate) return;
+
+    if (this.pc && this.pc.remoteDescription) {
+      try {
+        await this.pc.addIceCandidate(m.candidate);
+      } catch {
+        /* stale candidate */
+      }
+    } else {
+      this.pendingIce.push(m.candidate);
+    }
+  }
+
+  private closeViewerPc(): void {
+    if (this.pc) {
+      this.pc.ontrack = null;
+      this.pc.onicecandidate = null;
+      this.pc.onconnectionstatechange = null;
+      this.pc.oniceconnectionstatechange = null;
+      this.pc.close();
+      this.pc = null;
+    }
+    this.pendingIce = [];
+  }
+
+  // ======================================================================
+  // Shared
+  // ======================================================================
+
+  stop(): void {
+    this.stopped = true;
+
+    if (this.retryTimer) {
+      clearInterval(this.retryTimer);
+      this.retryTimer = null;
+    }
+
+    // Tell the other side we are leaving, then tear everything down.
+    this.signaling.send('goodbye', { from: this.userId, role: this.role });
+
+    this.clearSignaling();
+    this.closeAllPeers();
+    this.closeViewerPc();
+
+    this.localStream?.getTracks().forEach((track) => track.stop());
     this.localStream = null;
-    this.senders = [];
+    this.remoteStream = null;
+
+    // Give the "goodbye" broadcast a moment to flush before closing the channel.
+    const signaling = this.signaling;
+    setTimeout(() => signaling.close?.(), 300);
+  }
+
+  private clearSignaling(): void {
+    this.unsubscribers.forEach((unsubscribe) => unsubscribe());
+    this.unsubscribers = [];
+  }
+
+  private assertRole(expected: StreamRole): void {
+    if (this.role !== expected) {
+      throw new Error(`This method is only available for the ${expected} role`);
+    }
   }
 }
