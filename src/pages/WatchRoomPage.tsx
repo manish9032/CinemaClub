@@ -71,6 +71,7 @@ export default function WatchRoomPage() {
   const [inputFocused, setInputFocused] = useState(false);
   const [, setTick] = useState(0);
   const [showInvite, setShowInvite] = useState(false);
+  const [roomDeleted, setRoomDeleted] = useState(false);
   const [copied, setCopied] = useState<'code' | 'link' | null>(null);
 
   const hostRef = useRef<WebRTCStream | null>(null);
@@ -79,6 +80,7 @@ export default function WatchRoomPage() {
   const remoteShellRef = useRef<HTMLDivElement>(null);
   const blobUrlRef = useRef<string | null>(null);
   const chatOpenRef = useRef(true);
+  const syncChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const arrivedAtRef = useRef<Map<string, number>>(new Map());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const youtubeInputRef = useRef<HTMLInputElement>(null);
@@ -162,9 +164,17 @@ export default function WatchRoomPage() {
           );
         }
       )
+      // Host deleted the room -> everybody leaves (DB event + instant broadcast)
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'rooms' }, (payload) => {
+        const old = payload.old as { id?: string } | undefined;
+        if (old?.id && old.id.toUpperCase() === roomId.toUpperCase()) setRoomDeleted(true);
+      })
+      .on('broadcast', { event: 'room-deleted' }, () => setRoomDeleted(true))
       .subscribe();
+    syncChannelRef.current = channel;
 
     return () => {
+      syncChannelRef.current = null;
       void supabase.removeChannel(channel);
     };
   }, [roomId, user]);
@@ -181,6 +191,41 @@ export default function WatchRoomPage() {
       setLocalFileName(room.local_file_name);
     }
   }, [isHost, room?.video_src_type, room?.video_src, room?.local_file_name]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ---------------------------------------------------------------------
+  // Room deleted by the host
+  // ---------------------------------------------------------------------
+  const hasRoom = room !== null;
+
+  // Safety net: if the realtime event is missed, notice the room is gone anyway
+  useEffect(() => {
+    if (USE_LOCAL || !roomId || !userId || !hasRoom || roomDeleted) return;
+    let misses = 0;
+    const timer = setInterval(async () => {
+      const { data, error: checkError } = await supabase
+        .from('rooms')
+        .select('id')
+        .eq('id', roomId.toUpperCase())
+        .maybeSingle();
+      if (checkError) return; // network problem – do not treat as deleted
+      if (data) {
+        misses = 0;
+        return;
+      }
+      misses += 1;
+      if (misses >= 2) setRoomDeleted(true);
+    }, 15000);
+    return () => clearInterval(timer);
+  }, [roomId, userId, hasRoom, roomDeleted]);
+
+  // Stop sharing and go back home a few seconds after the room is deleted
+  useEffect(() => {
+    if (!roomDeleted) return;
+    hostRef.current?.stop();
+    hostRef.current = null;
+    const timer = setTimeout(() => navigate('/'), 5000);
+    return () => clearTimeout(timer);
+  }, [roomDeleted, navigate]);
 
   // ---------------------------------------------------------------------
   // Members + chat
@@ -428,7 +473,7 @@ export default function WatchRoomPage() {
   // VIEWER: receive the live MediaStream
   // ---------------------------------------------------------------------
   useEffect(() => {
-    if (isHost || !roomId || !userId || room?.video_src_type !== 'local') return;
+    if (isHost || roomDeleted || !roomId || !userId || room?.video_src_type !== 'local') return;
 
     setStatus('Waiting for host...');
     const viewer = new WebRTCStream('viewer', userId, createRoomSignaling(roomId, userId), {
@@ -456,7 +501,7 @@ export default function WatchRoomPage() {
       viewer.stop();
       setRemoteStream(null);
     };
-  }, [isHost, roomId, userId, room?.video_src_type]);
+  }, [isHost, roomDeleted, roomId, userId, room?.video_src_type]);
 
   /** Play the live stream; if the browser blocks autoplay, mute and retry. */
   const playRemote = useCallback(async (video: HTMLVideoElement) => {
@@ -509,6 +554,18 @@ export default function WatchRoomPage() {
     if (video.paused) void playRemote(video);
   };
 
+  /** Fullscreen the whole player box so the chat overlay stays visible (YouTube mode). */
+  const toggleWrapperFullscreen = async () => {
+    const el = playerWrapRef.current;
+    if (!el) return;
+    try {
+      if (!document.fullscreenElement) await el.requestFullscreen();
+      else await document.exitFullscreen();
+    } catch {
+      /* ignore */
+    }
+  };
+
   const toggleViewerFullscreen = async () => {
     const el = remoteShellRef.current;
     if (!el) return;
@@ -558,6 +615,11 @@ export default function WatchRoomPage() {
       alert(delError);
       return;
     }
+    try {
+      await syncChannelRef.current?.send({ type: 'broadcast', event: 'room-deleted', payload: {} });
+    } catch {
+      /* viewers will still get the database DELETE event */
+    }
     navigate('/');
   };
 
@@ -572,6 +634,22 @@ export default function WatchRoomPage() {
   // ---------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------
+  if (roomDeleted) {
+    return (
+      <div className="min-h-screen bg-obsidian pt-24 px-4 flex items-center justify-center">
+        <div className="glass rounded-2xl p-8 text-center max-w-md">
+          <h1 className="font-display text-2xl font-semibold text-text mb-2">Room deleted</h1>
+          <p className="text-sm text-muted mb-5">
+            The host deleted this room, so the watch party has ended. Taking you back home...
+          </p>
+          <button onClick={() => navigate('/')} className="btn-primary text-sm">
+            Back to home
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (!user) {
     return (
       <div className="min-h-screen bg-obsidian pt-24 flex items-center justify-center text-muted">
@@ -938,6 +1016,15 @@ export default function WatchRoomPage() {
             </div>
           )}
           {overlayInWrapper && chatOverlay}
+          {youtubeId && (
+            <button
+              type="button"
+              onClick={toggleWrapperFullscreen}
+              className="absolute right-3 bottom-[46px] z-20 text-xs text-white/90 hover:text-white bg-black/55 border border-white/15 rounded px-2 py-1"
+            >
+              {isFs ? 'Exit fullscreen' : '⛶ Fullscreen'}
+            </button>
+          )}
         </div>
 
         {!youtubeId && room?.video_src_type === 'local' && (
