@@ -133,6 +133,7 @@ export default function YouTubePlayer({
         playerVars: {
           autoplay: 0,
           controls: 1,
+          fs: 0, // use our own fullscreen button so the chat overlay stays visible
           modestbranding: 1,
           rel: 0,
           playsinline: 1,
